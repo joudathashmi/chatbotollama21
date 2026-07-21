@@ -1,0 +1,55 @@
+.env
+.env.local
+data/human_feedback.jsonl
+# Uploaded / ingested document blobs (metadata lives in DB or memory store)
+data/documents/
+data/documents_inbox/
+
+# Quality-loop feedback log (thumbs up/down). Per-environment, not
+# committed. Override path with MISA_FEEDBACK_LOG=/path/to/log.
+feedback.jsonl
+
+# Application logs (rotated daily by the logging subsystem)
+logs/
+*.log
+
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Tests / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+# Microsoft Office lock files (created while a .docx/.xlsx is open
+# in Word/Excel; deleted on close — never useful in git).
+~$*
+*.json
+!tests/**/*.json   # …but DO track test fixtures (golden_cases.json etc.)
+venv/
+*.jsonl
+# docs/ is intentionally tracked so HANDOVER.md ships with the repo.
+# Service-account keys and any other secret material.
+credentials/
+*.env
+# Backups/variants of the env file also carry live secrets — never commit
+# (e.g. .env.bak, .env.local.bak, .env.prod).
+.env.*
+.gitlab-ci-local/
+.pip-cache/
+# Generated coverage report (emitted by the CI test job).
+coverage.xml

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MISA API Tester</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; padding: 20px; }
+  h1 { color: #7c3aed; margin-bottom: 20px; font-size: 1.4rem; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tab { padding: 8px 16px; border-radius: 6px; border: 1px solid #374151; background: #1f2937;
+         cursor: pointer; font-size: 0.85rem; color: #9ca3af; }
+  .tab.active { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  label { display: block; font-size: 0.8rem; color: #9ca3af; margin-bottom: 4px; margin-top: 12px; }
+  input, textarea, select {
+    width: 100%; padding: 8px 10px; background: #1f2937; border: 1px solid #374151;
+    border-radius: 6px; color: #e2e8f0; font-size: 0.85rem; font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 60px; }
+  button {
+    margin-top: 14px; padding: 9px 20px; background: #7c3aed; color: #fff;
+    border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem;
+  }
+  button:hover { background: #6d28d9; }
+  button:disabled { background: #374151; cursor: default; }
+  .out {
+    margin-top: 14px; background: #111827; border: 1px solid #374151; border-radius: 8px;
+    padding: 14px; min-height: 80px; font-size: 0.82rem; white-space: pre-wrap;
+    word-break: break-word; max-height: 500px; overflow-y: auto; line-height: 1.6;
+  }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;
+           margin-left: 8px; }
+  .ok { background: #065f46; color: #6ee7b7; }
+  .err { background: #7f1d1d; color: #fca5a5; }
+  .info { background: #1e3a5f; color: #93c5fd; }
+  .spinner { color: #7c3aed; }
+  .row { display: flex; gap: 10px; align-items: flex-end; }
+  .row > * { flex: 1; }
+  .row button { flex: 0 0 auto; margin-top: 0; }
+</style>
+</head>
+<body>
+<h1>MISA Intelligence API — Test UI</h1>
+
+<!-- LOGIN BAR -->
+<div style="background:#1f2937; border:1px solid #374151; border-radius:8px; padding:12px 14px; margin-bottom:16px;">
+  <div class="row">
+    <div>
+      <label style="margin-top:0">Username</label>
+      <input id="login-user" value="SmartChatbot">
+    </div>
+    <div>
+      <label style="margin-top:0">Password</label>
+      <input id="login-pass" type="password" placeholder="API_PASSWORD from .env">
+    </div>
+    <button onclick="doLogin()" id="login-btn">Login</button>
+  </div>
+  <div id="login-status" style="margin-top:8px; font-size:0.8rem; color:#9ca3af;">Not logged in — endpoints below need a token.</div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="show('health')">Health</div>
+  <div class="tab" onclick="show('questions')">Questions</div>
+  <div class="tab" onclick="show('chat')">Chat</div>
+  <div class="tab" onclick="show('search')">Search</div>
+  <div class="tab" onclick="show('engagement')">Engagement</div>
+</div>
+
+<!-- HEALTH -->
+<div id="health" class="panel active">
+  <button onclick="doHealth()">GET /health</button>
+  <div class="out" id="health-out">Click the button to check server status.</div>
+</div>
+
+<!-- QUESTIONS -->
+<div id="questions" class="panel">
+  <button onclick="doQuestions()">GET /api/v1/questions</button>
+  <div class="out" id="questions-out">Click to load preset questions.</div>
+</div>
+
+<!-- CHAT -->
+<div id="chat" class="panel">
+  <label>Question</label>
+  <textarea id="chat-q" rows="2">What does company_profiles say about Alphabet, Inc.?</textarea>
+  <label>Locale</label>
+  <select id="chat-locale" style="width:120px">
+    <option value="en">en</option>
+    <option value="ar">ar</option>
+  </select>
+  <label><input type="checkbox" id="chat-stream" checked> Stream (SSE)</label>
+  <button onclick="doChat()" id="chat-btn">Send</button>
+  <div class="out" id="chat-out"></div>
+</div>
+
+<!-- SEARCH -->
+<div id="search" class="panel">
+  <label>Filters (JSON)</label>
+  <textarea id="search-filters" rows="3">{"rhq_city": {"op": "=", "value": "Riyadh"}}</textarea>
+  <label>Order by</label>
+  <input id="search-order" value="revenue_usd" style="width:160px">
+  <label>Limit</label>
+  <input id="search-limit" type="number" value="5" style="width:80px">
+  <button onclick="doSearch()">Search (NDJSON)</button>
+  <div class="out" id="search-out"></div>
+</div>
+
+<!-- ENGAGEMENT -->
+<div id="engagement" class="panel">
+  <label>Entity</label>
+  <input id="eng-entity" value="BlackRock">
+  <label>Mode</label>
+  <select id="eng-mode">
+    <option value="quick">quick — 4 tiles</option>
+    <option value="full">full — 19 sections</option>
+  </select>
+  <label>Context (optional)</label>
+  <input id="eng-ctx" placeholder="e.g. Meeting scheduled for June board session">
+  <label><input type="checkbox" id="eng-stream" checked> Stream (SSE)</label>
+  <button onclick="doEngagement()" id="eng-btn">Generate</button>
+  <div class="out" id="eng-out"></div>
+</div>
+
+<script>
+const BASE = "http://localhost:8001";
+
+let TOKEN = sessionStorage.getItem('misa_token') || null;
+if (TOKEN) setLoginStatus(true);
+
+function authHeaders(extra = {}) {
+  return TOKEN ? { ...extra, 'Authorization': 'Bearer ' + TOKEN } : extra;
+}
+
+function setLoginStatus(ok, msg) {
+  const el = document.getElementById('login-status');
+  if (ok) {
+    el.innerHTML = '<span class="badge ok">Logged in</span> Token active for this browser session.';
+  } else {
+    el.innerHTML = '<span class="badge err">Not logged in</span> ' + (msg || 'Endpoints below need a token.');
+  }
+}
+
+async function doLogin() {
+  const username = document.getElementById('login-user').value.trim();
+  const password = document.getElementById('login-pass').value;
+  const btn = document.getElementById('login-btn');
+  btn.disabled = true;
+  try {
+    const r = await fetch(`${BASE}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify({ username, password })
+    });
+    const d = await r.json();
+    if (r.ok && d.access_token) {
+      TOKEN = d.access_token;
+      sessionStorage.setItem('misa_token', TOKEN);
+      setLoginStatus(true);
+    } else {
+      TOKEN = null;
+      sessionStorage.removeItem('misa_token');
+      setLoginStatus(false, d.error?.message || ('Login failed (' + r.status + ')'));
+    }
+  } catch(e) { setLoginStatus(false, 'Error: ' + e.message); }
+  btn.disabled = false;
+}
+
+function show(id) {
+  document.querySelectorAll('.tab').forEach((t,i) => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  event.target.classList.add('active');
+}
+
+function write(id, text) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.scrollTop = el.scrollHeight;
+}
+function append(id, text) {
+  const el = document.getElementById(id);
+  el.textContent += text;
+  el.scrollTop = el.scrollHeight;
+}
+function badge(status) {
+  return status >= 200 && status < 300
+    ? `<span class="badge ok">${status} OK</span>`
+    : `<span class="badge err">${status}</span>`;
+}
+
+async function doHealth() {
+  write('health-out', 'Checking…');
+  try {
+    const r = await fetch(`${BASE}/health`);
+    const d = await r.json();
+    write('health-out', JSON.stringify(d, null, 2));
+  } catch(e) { write('health-out', 'Error: ' + e.message); }
+}
+
+async function doQuestions() {
+  write('questions-out', 'Loading…');
+  try {
+    const r = await fetch(`${BASE}/api/v1/questions`, { headers: authHeaders() });
+    const d = await r.json();
+    write('questions-out', d.questions.map((q,i) => `${i+1}. ${q}`).join('\n\n'));
+  } catch(e) { write('questions-out', 'Error: ' + e.message); }
+}
+
+async function doChat() {
+  const q = document.getElementById('chat-q').value.trim();
+  const locale = document.getElementById('chat-locale').value;
+  const stream = document.getElementById('chat-stream').checked;
+  const btn = document.getElementById('chat-btn');
+  if (!q) return;
+
+  btn.disabled = true;
+  write('chat-out', stream ? '⏳ Connecting…' : '⏳ Waiting…');
+
+  const body = JSON.stringify({ question: q, locale, stream });
+
+  if (!stream) {
+    try {
+      const r = await fetch(`${BASE}/api/v1/chat`, {
+        method: 'POST', headers: authHeaders({'Content-Type':'application/json'}), body
+      });
+      const d = await r.json();
+      write('chat-out', d.error
+        ? '❌ ' + d.error
+        : d.answer + '\n\n— ' + (d.rows?.length ?? 0) + ' row(s) returned');
+    } catch(e) { write('chat-out', 'Error: ' + e.message); }
+    btn.disabled = false;
+    return;
+  }
+
+  try {
+    const r = await fetch(`${BASE}/api/v1/chat`, {
+      method: 'POST', headers: authHeaders({'Content-Type':'application/json'}), body
+    });
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let raw = '', out = '';
+    write('chat-out', '');
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      raw += dec.decode(value, { stream: true });
+      const parts = raw.split('\n\n');
+      raw = parts.pop();
+      for (const part of parts) {
+        const line = part.startsWith('data: ') ? part.slice(6) : part;
+        if (!line) continue;
+        try {
+          const evt = JSON.parse(line);
+          if (evt.type === 'status')  append('chat-out', '⏳ ' + evt.message + '\n');
+          if (evt.type === 'rows')    append('chat-out', `📋 ${evt.row_count} row(s) retrieved\n\n`);
+          if (evt.type === 'chunk')   append('chat-out', evt.text);
+          if (evt.type === 'error')   append('chat-out', '\n❌ ' + evt.message);
+          if (evt.type === 'done')    append('chat-out', '\n\n✅ Done');
+        } catch {}
+      }
+    }
+  } catch(e) { append('chat-out', '\nError: ' + e.message); }
+  btn.disabled = false;
+}
+
+async function doSearch() {
+  let filters;
+  try { filters = JSON.parse(document.getElementById('search-filters').value); }
+  catch { write('search-out', '❌ Invalid JSON in filters'); return; }
+
+  const order_by = document.getElementById('search-order').value.trim() || undefined;
+  const limit = parseInt(document.getElementById('search-limit').value) || 5;
+  write('search-out', '⏳ Searching…');
+
+  try {
+    const r = await fetch(`${BASE}/api/v1/search`, {
+      method: 'POST',
+      headers: authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify({ filters, order_by, descending: true, limit })
+    });
+    const text = await r.text();
+    const rows = text.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+    if (!rows.length) { write('search-out', 'No rows returned.'); return; }
+    write('search-out', `${rows.length} row(s):\n\n` +
+      rows.map((r,i) => `[${i+1}] ${r.company_name || '—'}  |  rev: ${r.revenue_usd ?? '—'}  |  rhq_city: ${r.rhq_city ?? '—'}`).join('\n')
+    );
+  } catch(e) { write('search-out', 'Error: ' + e.message); }
+}
+
+async function doEngagement() {
+  const entity = document.getElementById('eng-entity').value.trim();
+  const mode = document.getElementById('eng-mode').value;
+  const context = document.getElementById('eng-ctx').value.trim();
+  const stream = document.getElementById('eng-stream').checked;
+  const btn = document.getElementById('eng-btn');
+  if (!entity) return;
+
+  btn.disabled = true;
+  write('eng-out', stream ? '⏳ Connecting…' : '⏳ Generating (may take ~60 s)…');
+
+  const body = JSON.stringify({ entity, mode, context, stream });
+
+  if (!stream) {
+    try {
+      const r = await fetch(`${BASE}/api/v1/engagement/generate`, {
+        method: 'POST', headers: authHeaders({'Content-Type':'application/json'}), body
+      });
+      const d = await r.json();
+      write('eng-out', d.error ? '❌ ' + d.error : d.text);
+    } catch(e) { write('eng-out', 'Error: ' + e.message); }
+    btn.disabled = false;
+    return;
+  }
+
+  try {
+    const r = await fetch(`${BASE}/api/v1/engagement/generate`, {
+      method: 'POST', headers: authHeaders({'Content-Type':'application/json'}), body
+    });
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let raw = '';
+    write('eng-out', '');
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      raw += dec.decode(value, { stream: true });
+      const parts = raw.split('\n\n');
+      raw = parts.pop();
+      for (const part of parts) {
+        const line = part.startsWith('data: ') ? part.slice(6) : part;
+        if (!line || line === '[DONE]') continue;
+        try {
+          const evt = JSON.parse(line);
+          if (evt.meta?.phase === 'opening')  append('eng-out', '⏳ Preparing…\n');
+          if (evt.meta?.phase === 'research') append('eng-out', '🔍 Researching with web search…\n\n');
+          if (evt.delta)  append('eng-out', evt.delta);
+          if (evt.error)  append('eng-out', '\n❌ ' + evt.error);
+        } catch {}
+      }
+    }
+    append('eng-out', '\n\n✅ Done');
+  } catch(e) { append('eng-out', '\nError: ' + e.message); }
+  btn.disabled = false;
+}
+</script>
+</body>
+</html>

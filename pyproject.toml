@@ -1,0 +1,69 @@
+# Tooling configuration for the MISA Intelligence API.
+# Runtime dependencies live in requirements.txt; dev/test tooling in
+# requirements-dev.txt. This file only configures the quality gates
+# (ruff, mypy, pytest, coverage) so `pip` is not driven from here.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# Never lint the virtualenv or generated caches.
+extend-exclude = ["venv", ".venv", "build", "dist", "__pycache__"]
+
+[tool.ruff.lint]
+# Start from pyflakes (F — real bugs: undefined names, unused imports)
+# plus the pycodestyle error/warning subset (E, W). This is deliberately
+# a pragmatic baseline for an existing codebase, not a maximalist ruleset;
+# it can be ratcheted up (I, UP, B, SIM, …) over time.
+select = ["E", "F", "W"]
+ignore = [
+    # This codebase intentionally does ordered / lazy mid-file imports
+    # (e.g. app/main.py configures logging before importing routers, and
+    # chat_engine.py defers heavy imports for startup speed / circular-dep
+    # avoidance). Flagging those is noise, not signal.
+    "E402",
+    # Compound statements with `;` are used sparingly and on purpose in a
+    # few tight helpers; not worth churning the code to remove.
+    "E701",
+    "E702",
+    # Line-length is not enforced: the codebase has no autoformatter and
+    # many intentionally long comment/string lines. Enforcing E501 would
+    # mean reformatting ~130 lines of working code for no functional gain.
+    # Revisit if/when `ruff format` (or black) is adopted.
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests favour readability over import hygiene; unused imports there are
+# usually fixtures-in-progress, not dead code that ships.
+"tests/*" = ["F401", "E501"]
+
+[tool.mypy]
+# Type checking is introduced as a NON-BLOCKING signal first (see the
+# `type_check` CI job with allow_failure: true). Keep it lenient so it
+# surfaces genuine issues without drowning in "untyped legacy" noise;
+# tighten module-by-module as annotations are added.
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = false
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = false
+disallow_untyped_defs = false
+exclude = "(venv|\\.venv|build|dist|tests|scripts)/"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short"
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/venv/*",
+    "*/scripts/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

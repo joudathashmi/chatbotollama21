@@ -1,0 +1,471 @@
+stages:
+  - lint
+  - test
+  - dependency_scanning
+  - build
+  - deploy_dev
+  - deploy
+  - deploy_pre_prod
+  - deploy_production
+  - dast
+
+variables:
+  PYTHON_VERSION: "3.11"
+  APP_NAME: "Ultra-fastapi"
+  # SAST Configuration
+  SAST_EXCLUDED_PATHS: "spec,test,tests,tmp,.venv,node_modules"
+  SECURE_ANALYZERS_PREFIX: "registry.gitlab.com/security-products"
+  SAST_EXPERIMENTAL_FEATURES: "true"
+  # DAST Configuration
+  DAST_BROWSER_SCAN: "true"
+  DAST_FULL_SCAN_ENABLED: "false"
+  # Secret Detection Configuration
+  SECRET_DETECTION_HISTORIC_SCAN: "false"
+
+# Include GitLab Security templates
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Dependency-Scanning.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+  - template: DAST.gitlab-ci.yml
+
+# Disable default DAST job from template (we use custom ones)
+dast:
+  rules:
+    - when: never
+
+cache:
+  key:
+    files:
+      - requirements.txt
+      - requirements-dev.txt
+  paths:
+    - .pip-cache/
+  policy: pull-push
+
+# ============================================
+# LINT STAGE
+# ============================================
+# Fast, dependency-light static quality gates. `lint` (ruff) is a hard
+# gate — the codebase is already clean against the configured ruleset
+# (see pyproject.toml). `type_check` (mypy) is introduced as a
+# NON-BLOCKING signal (allow_failure: true) so it surfaces issues while
+# annotations are added incrementally; flip allow_failure to false once
+# the tree is clean.
+lint:
+  stage: lint
+  image: python:${PYTHON_VERSION}-slim
+  tags:
+    - docker
+  interruptible: true
+  before_script:
+    - pip install --upgrade pip --cache-dir .pip-cache
+    - pip install ruff==0.15.22 --cache-dir .pip-cache
+  script:
+    - echo "🔎 Running ruff..."
+    - ruff check app/ tests/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  allow_failure: false
+
+type_check:
+  stage: lint
+  image: python:${PYTHON_VERSION}-slim
+  tags:
+    - docker
+  interruptible: true
+  before_script:
+    - pip install --upgrade pip --cache-dir .pip-cache
+    - pip install mypy==2.3.0 --cache-dir .pip-cache
+  script:
+    - echo "🧬 Running mypy (non-blocking)..."
+    - mypy app/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  allow_failure: true
+
+# ============================================
+# SECURITY SCANNING JOBS
+# ============================================
+
+# bandit-sast was deprecated in GitLab 14.8 and removed in 15.4 — disable it
+bandit-sast:
+  rules:
+    - when: never
+
+semgrep-sast:
+  tags:
+    - docker
+  variables:
+    SAST_EXCLUDED_PATHS: "spec,test,tests,tmp,.venv"
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    # - if: '$CI_COMMIT_BRANCH == "pre-prod"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# Override Dependency Scanning jobs
+gemnasium-dependency_scanning:
+  stage: dependency_scanning
+  tags:
+    - docker
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    # - if: '$CI_COMMIT_BRANCH == "pre-prod"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+gemnasium-python-dependency_scanning:
+  stage: dependency_scanning
+  tags:
+    - docker
+  allow_failure: false
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq gcc libcairo2-dev pkg-config
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    # - if: '$CI_COMMIT_BRANCH == "pre-prod"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# Override Secret Detection job
+secret_detection:
+  stage: test
+  tags:
+    - docker
+  allow_failure: false
+  variables:
+    SECRET_DETECTION_HISTORIC_SCAN: "false"
+    SECRET_DETECTION_EXCLUDED_PATHS: ".venv,node_modules,tests"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    # - if: '$CI_COMMIT_BRANCH == "pre-prod"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ============================================
+# TEST STAGE
+# ============================================
+test:
+  stage: test
+  image: python:${PYTHON_VERSION}-slim
+  tags:
+    - docker
+  interruptible: true
+  variables:
+    PYTHONPATH: "$CI_PROJECT_DIR"
+    # Use system Chromium — Playwright CDN (cdn.playwright.dev) is unreachable
+    # from this runner. PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD prevents pip install
+    # from triggering a download; PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH points
+    # Playwright at the apt-installed binary instead.
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: "/usr/bin/chromium"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq gcc libcairo2-dev pkg-config chromium xvfb
+    - pip install --upgrade pip --cache-dir .pip-cache
+    - pip install -r requirements-dev.txt --cache-dir .pip-cache
+  script:
+    - echo "🧪 Running pytest with coverage..."
+    # --cov-fail-under=55 is a ratchet set just below the current ~56%
+    # baseline: it prevents coverage regressions without blocking today,
+    # and should be raised as the core (chat_engine/database/routers)
+    # gains tests. Coverage XML is emitted for GitLab's MR coverage view.
+    - >
+      pytest tests/ -v --tb=short
+      --cov=app --cov-report=term-missing --cov-report=xml
+      --cov-fail-under=55
+  coverage: '/^TOTAL\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)%/'
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    # - if: '$CI_COMMIT_BRANCH == "pre-prod"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  allow_failure: false
+
+# Real-binary smoke test for the malware scanner's clamscan backend
+clamscan_smoke_test:
+  stage: test
+  image: python:${PYTHON_VERSION}-slim
+  tags:
+    - docker
+  interruptible: true
+  variables:
+    PYTHONPATH: "$CI_PROJECT_DIR"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq clamav clamav-freshclam
+    - freshclam --quiet
+    - pip install --upgrade pip --cache-dir .pip-cache
+    - pip install -r requirements.txt --cache-dir .pip-cache
+  script:
+    - echo "🦠 Verifying the real clamscan binary detects EICAR..."
+    - python scripts/verify_clamscan.py
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    # - if: '$CI_COMMIT_BRANCH == "pre-prod"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  allow_failure: true
+
+# ============================================
+# GOLDEN BATTERY (end-to-end answer-quality regression)
+# ============================================
+# Unlike the unit suite, this battery (tests/golden_cases.json) exercises the
+# WHOLE stack — it POSTs real questions at a running API that talks to the
+# live Postgres data and a real OpenAI key — so it CANNOT run in the normal
+# per-commit pipeline (no DB/model there, and each run costs real tokens).
+#
+# Instead it targets an ALREADY-DEPLOYED environment via MISA_BATTERY_URL and
+# is intentionally:
+#   - manual      → an operator fires it after a deploy, and/or
+#   - scheduled   → wire a nightly GitLab pipeline schedule to run it, and
+#   - non-blocking (allow_failure: true) → it REPORTS answer-quality
+#     regressions (results saved as an artifact) but never gates the pipeline.
+#
+# Required CI/CD variables:
+#   MISA_BATTERY_URL   full chat endpoint, e.g. https://dev.example/api/v1/chat
+#   MISA_BATTERY_USER  API username (JWT login)
+#   MISA_BATTERY_PASS  API password (JWT login)
+#   (script POSTs /api/v1/auth/login then uses Bearer access_token)
+golden_battery:
+  stage: test
+  image: python:${PYTHON_VERSION}-slim
+  tags:
+    - docker
+  interruptible: true
+  variables:
+    PYTHONPATH: "$CI_PROJECT_DIR"
+  before_script:
+    - pip install --upgrade pip --cache-dir .pip-cache
+  script:
+    - |
+      if [ -z "$MISA_BATTERY_URL" ]; then
+        echo "❌ MISA_BATTERY_URL is not set."
+        echo "   Point it at a deployed /api/v1/chat endpoint (and set"
+        echo "   MISA_BATTERY_USER / MISA_BATTERY_PASS) in CI/CD variables."
+        exit 1
+      fi
+    - echo "🎯 Running golden battery against $MISA_BATTERY_URL ..."
+    # Single run: writes machine-readable results to the artifact AND prints a
+    # human-readable summary to the job log. Exit 1 on any FAIL, but the job is
+    # allow_failure so it surfaces regressions without blocking.
+    - python scripts/run_golden_tests.py --out=golden_results.json
+  artifacts:
+    when: always
+    paths:
+      - golden_results.json
+    expire_in: 1 month
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  allow_failure: true
+
+# ============================================
+# BUILD STAGE
+# ============================================
+build:
+  stage: build
+  image: python:${PYTHON_VERSION}-slim
+  tags:
+    - docker
+  interruptible: true
+  resource_group: ultra-fastapi-build
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq gcc libcairo2-dev pkg-config
+    - pip install --upgrade pip --cache-dir .pip-cache
+  script:
+    - echo "📦 Installing dependencies..."
+    - pip install -r requirements.txt --cache-dir .pip-cache
+    - echo "🔍 Verifying app syntax..."
+    - python -m compileall app/ -q
+    - echo "✅ Build completed successfully"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    # - if: '$CI_COMMIT_BRANCH == "pre-prod"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ============================================
+# DEV DEPLOYMENT
+# ============================================
+deploy_dev:
+  stage: deploy_dev
+  image: debian:stable-slim
+  tags:
+    - docker
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl
+  dependencies:
+    - build
+  script:
+    - echo "🚀 Triggering deployment to Kloudbean Dev environment..."
+    - |
+      curl -X POST "${KLOUDBEAN_FASTAPI_DEV_WEBHOOK_URL}" \
+        -H "Content-Type: application/json" \
+        -H "X-GitLab-Token: ${KLOUDBEAN_FASTAPI_DEV_SECRET_TOKEN}" \
+        -d "{\"event_name\":\"push\"}"
+    - echo "✅ Deployment webhook triggered"
+    - echo "Uvicorn will automatically restart the application"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  environment:
+    name: development
+    url: $FASTAPI_DEV_URL
+
+# ============================================
+# STAGING DEPLOYMENT
+# ============================================
+deploy_staging:
+  stage: deploy
+  image: debian:stable-slim
+  tags:
+    - docker
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl
+  dependencies:
+    - build
+  script:
+    - echo "🧪 Triggering deployment to Kloudbean Staging environment..."
+    - |
+      curl -X POST "${KLOUDBEAN_FASTAPI_STAGING_WEBHOOK_URL}" \
+        -H "Content-Type: application/json" \
+        -H "X-GitLab-Token: ${KLOUDBEAN_FASTAPI_STAGING_SECRET_TOKEN}" \
+        -d "{\"event_name\":\"push\"}"
+    - echo "✅ Deployment webhook triggered"
+    - echo "Uvicorn will automatically restart the application"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  environment:
+    name: staging
+    url: $FASTAPI_STAGING_URL
+
+# ============================================
+# PRE-PROD DEPLOYMENT
+# ============================================
+# deploy_pre_prod:
+#   stage: deploy_pre_prod
+#   image: debian:stable-slim
+#   tags:
+#     - docker
+#   before_script:
+#     - apt-get update -qq && apt-get install -y -qq curl
+#   dependencies:
+#     - build
+#   script:
+#     - echo "🟡 Triggering deployment to Kloudbean Pre-Prod environment..."
+#     - |
+#       curl -X POST "${KLOUDBEAN_FASTAPI_PREPROD_WEBHOOK_URL}" \
+#         -H "Content-Type: application/json" \
+#         -H "X-GitLab-Token: ${KLOUDBEAN_FASTAPI_PREPROD_SECRET_TOKEN}" \
+#         -d "{\"event_name\":\"push\"}"
+#     - echo "✅ Deployment webhook triggered"
+#     - echo "Uvicorn will automatically restart the application"
+#   rules:
+#     - if: '$CI_COMMIT_BRANCH == "pre-prod"'
+#   environment:
+#     name: pre-production
+#     url: $FASTAPI_PREPROD_URL
+
+# ============================================
+# PRODUCTION DEPLOYMENT (commented out)
+# ============================================
+# deploy_production:
+#   stage: deploy_production
+#   image: debian:stable-slim
+#   tags:
+#     - docker
+#   before_script:
+#     - apt-get update -qq && apt-get install -y -qq curl
+#   dependencies:
+#     - build
+#   script:
+#     - echo "🔴 Triggering deployment to Kloudbean Production environment..."
+#     - |
+#       curl -X POST "${KLOUDBEAN_FASTAPI_PROD_WEBHOOK_URL}" \
+#         -H "Content-Type: application/json" \
+#         -H "X-GitLab-Token: ${KLOUDBEAN_FASTAPI_PROD_SECRET_TOKEN}" \
+#         -d "{\"event_name\":\"push\"}"
+#     - echo "✅ Deployment webhook triggered"
+#   rules:
+#     - if: '$CI_COMMIT_BRANCH == "main"'
+#   environment:
+#     name: production
+#     url: $FASTAPI_PROD_URL
+
+# ============================================
+# DAST JOBS
+# ============================================
+
+# DAST - DEV Environment
+dast_dev:
+  extends: dast
+  stage: dast
+  tags:
+    - docker
+  variables:
+    DAST_WEBSITE: "$FASTAPI_DEV_URL"
+  dependencies:
+    - deploy_dev
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  allow_failure: false
+
+# DAST - Staging Environment
+dast_staging:
+  extends: dast
+  stage: dast
+  tags:
+    - docker
+  variables:
+    DAST_WEBSITE: "$FASTAPI_STAGING_URL"
+  dependencies:
+    - deploy_staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  allow_failure: false
+
+# # DAST - Pre-Production Environment
+# dast_pre_prod:
+#   extends: dast
+#   stage: dast
+#   tags:
+#     - docker
+#   variables:
+#     DAST_WEBSITE: "$FASTAPI_PREPROD_URL"
+#   dependencies:
+#     - deploy_pre_prod
+#   rules:
+#     - if: '$CI_COMMIT_BRANCH == "pre-prod"'
+#   allow_failure: false
+
+# # DAST - Production Environment
+# dast_production:
+#   extends: dast
+#   stage: dast
+#   tags:
+#     - docker
+#   variables:
+#     DAST_WEBSITE: "$FASTAPI_PROD_URL"
+#     DAST_FULL_SCAN_ENABLED: "true"
+#   dependencies:
+#     - deploy_production
+#   rules:
+#     - if: '$CI_COMMIT_BRANCH == "main"'
+#   allow_failure: false

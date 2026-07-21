@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# Runtime dependencies — everything imported by app/ at request time.
+# Pinned to exact versions for reproducible builds and deployments.
+# Dev/test/reporting tooling lives in requirements-dev.txt.
+#
+# To upgrade a pin: bump the version here, run the test suite, and commit
+# the change deliberately (don't float versions in production).
+# ---------------------------------------------------------------------------
+
+# Web framework + ASGI server
+fastapi==0.115.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.30
+
+# OpenAI (chat routing, curation, engagement dossiers, business-card structuring)
+openai==2.46.0
+
+# Google Cloud Vision — OCR for business-card uploads
+google-cloud-vision==3.15.0
+
+# Fuzzy country-name normalization for the business card reader
+# (maps OCR'd country text -> client's canonical country list).
+rapidfuzz==3.14.5
+
+# DuckDuckGo search backend for LinkedIn profile resolution (free provider).
+# The paid "serp" provider (Serper.dev) uses httpx, already pulled in by openai.
+ddgs==9.14.4
+
+# Playwright provider: headless Chromium scraping Bing search results for more
+# candidate profiles. Requires the browser binary: `playwright install chromium`.
+playwright==1.61.0
+
+# Postgres driver + dataframe handling for the query pipeline
+psycopg2-binary==2.9.12
+pandas==3.0.3
+numpy==2.5.1
+
+# Environment / config
+python-dotenv==1.2.2
+PyYAML==6.0.3
+
+# PDF export for executive briefings (POST /api/v1/export/pdf).
+# Both pure-Python, no system libraries required.
+markdown==3.10.2
+xhtml2pdf==0.2.17
+
+# Real image-content validation for business-card uploads (magic-byte /
+# decode check, not just the client-declared Content-Type header).
+Pillow==12.3.0
+
+# Auth (JWT issuance/verification + password hashing)
+PyJWT==2.13.0
+bcrypt==5.0.0
+
+# Optional shared rate-limit store (only imported when
+# MISA_RATE_LIMIT_BACKEND=redis). Enables accurate rate limiting across
+# multiple uvicorn workers / replicas; the app falls back to in-memory
+# throttling automatically if this backend is unset or Redis is down.
+redis==8.0.1
+
+# Document library — PDF / DOCX text extraction for upload + ingest
+pypdf==5.4.0
+python-docx==1.1.2
