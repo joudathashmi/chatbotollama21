@@ -31,10 +31,14 @@ from __future__ import annotations
 import json
 from typing import Any, Iterator
 
-from app.config import CHAT_OPENAI_STORE, openai_max_completion_tokens_kw
+from app.config import (
+    CHAT_OPENAI_STORE,
+    openai_advisory_max_tokens_kw,
+)
 from app.prompts.chat_system import curation_system_prompt
 from app.services.curation import (
     safe_rows_for_curation,
+    slim_rows_for_person_brief,
     classify_match,
 )
 
@@ -56,6 +60,20 @@ def _build_curation_messages(
     safe = safe_rows_for_curation(rows)
     if not safe:
         return None
+
+    _PEOPLE_TABLES = (
+        "executives", "company_executives", "rhq_topexecutives",
+        "board_positions", "contacts", "company_contact_records",
+        "related_people", "profiles", "personal_informations",
+        "misa_contact_details",
+    )
+    if (
+        table in _PEOPLE_TABLES
+        or (intent or "") in ("executive_lookup", "person_lookup", "executive_succession")
+    ):
+        if table not in _PEOPLE_TABLES:
+            table = "company_executives"
+        safe = slim_rows_for_person_brief(safe) or safe
 
     # Skip the no-match / fuzzy / broad classification logic for the
     # streaming path — those produce special messages that are simpler
@@ -99,8 +117,21 @@ def _build_curation_messages(
 
     payload = json.dumps(safe, ensure_ascii=False, default=str)
     table_label = f"`{table}`" if table else "the database"
+    anti_loop_note = ""
+    try:
+        from app.services.llm_residency import is_local_data_backend
+        if is_local_data_backend():
+            anti_loop_note = (
+                "HARD STOP (local model): Write EACH section at most ONCE. "
+                "End after ONE ## 🇸🇦 Strategic Read and one _Sources_ line. "
+                "Never invent From your documents / From the web / "
+                "What's Reported / Supporting reporting.\n\n"
+            )
+    except Exception:
+        pass
     user_content = (
         f"User question:\n{user_question}\n\n"
+        f"{anti_loop_note}"
         f"{depth_note}"
         f"{intent_note}"
         f"{market_intel_note}"
@@ -159,23 +190,50 @@ def stream_company_insights_chunks(
     from app.config import curation_model_for_depth, openai_determinism_kw
     model = curation_model_for_depth(depth, model)
     try:
+        from app.services.llm_residency import resolve_narrative_completion_client
+        client, model = resolve_narrative_completion_client(
+            client, preferred_model=model,
+        )
+    except Exception:
+        return
+    try:
+        from app.services.prompt_masking import mask_messages_for_llm
+        msgs = mask_messages_for_llm(msgs)
+    except Exception:
+        pass
+    try:
         stream = client.chat.completions.create(
             model=model,
             messages=msgs,
             store=CHAT_OPENAI_STORE,
             stream=True,
             **openai_determinism_kw(),
-            **openai_max_completion_tokens_kw(),
+            **openai_advisory_max_tokens_kw(),
         )
     except Exception:
         return
     try:
+        assembled = ""
         for event in stream:
             try:
                 delta = event.choices[0].delta
                 content = getattr(delta, "content", None)
-                if content:
-                    yield content
+                if not content:
+                    continue
+                assembled += content
+                low = assembled.lower()
+                # Abort early if the local model starts looping sections.
+                if low.count("strategic read") >= 3:
+                    break
+                if "from your documents" in low and low.find("from your documents") > 200:
+                    break
+                if "what's reported" in low and low.count("what's reported") >= 2:
+                    break
+                if len(assembled) > 400:
+                    tail = assembled[-120:]
+                    if assembled[:-120].find(tail) != -1:
+                        break
+                yield content
             except (IndexError, AttributeError):
                 continue
     except Exception:

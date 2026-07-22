@@ -14,25 +14,12 @@ Triggers (handled by chat_engine — see `is_deep_profile_request`):
   - "/profile Apple"           (slash-command style)
   - "/profile Saudi Arabia"
   - "deep profile of Apple"
-  - "executive briefing on Tim Cook"
-  - "strategic profile: Microsoft"
+  - "deep profile of Tim Cook"
 
-Output structure (the three pillars from the user's spec, with
-strict labelling discipline that the original spec lacked):
-
-  ### 1. Current Footprint & Baseline Metrics
-  ### 2. Leadership, Governance & Policy Architecture
-  ### 3. Macro-Strategic Implication & Tech Roadmap
-
-Every bullet is tagged with EXACTLY ONE provenance label:
-  [DB]        — sourced from MISA's database (verbatim)
-  [web]       — sourced from web search; cite the [web:N] handle
-  [inferred]  — analytical deduction; NOT a fact
-
-This is what makes the difference between "executive briefing" and
-"confident hallucination". Without these labels, the LLM mixes
-DB facts, web facts, and speculation into one undifferentiated
-paragraph and the reader can't tell which is which.
+Natural phrasing like "briefing on X", "company profile for X",
+"CEO profile for X", or "sector briefing for X" must NOT trigger
+this path — those use the normal Jul21 company / person / sector
+briefs.
 """
 
 from __future__ import annotations
@@ -41,7 +28,12 @@ import json
 import re
 from typing import Optional
 
-from app.config import ADVISORY_MODEL, OPENAI_MODEL, openai_max_completion_tokens_kw
+from app.config import (
+    ADVISORY_MODEL,
+    OPENAI_MODEL,
+    openai_determinism_kw,
+    openai_max_completion_tokens_kw,
+)
 from app.database import (
     COMPANY_TABLE,
     get_openai_client,
@@ -55,49 +47,13 @@ from app.services.curation import _safe_row
 
 # ───────────────────────── Trigger detection ─────────────────────────
 
+# Explicit opt-in ONLY. Bare "briefing" / "profile" / "executive briefing"
+# are Jul21 company/person depth signals — not deep-profile.
 _TRIGGER_RE = re.compile(
     r"^\s*"
     r"(?:"
     r"/profile\s+|"                              # /profile Apple
-    r"deep\s+profile\s+(?:of|on|for|about)?\s*|" # deep profile of Apple
-    r"executive\s+(?:profile|briefing)\s+(?:of|on|for|about)?\s*|"
-    r"strategic\s+profile\s*[:\-]?\s*|"          # strategic profile: Apple
-    r"full\s+profile\s+(?:of|on|for|about)?\s*"  # full profile of Apple
-    r")",
-    re.IGNORECASE,
-)
-
-
-# Tier 3 commit 3 — broader trigger set so the user doesn't need the
-# slash. Spec: words like "briefing", "executive briefing", "strategic
-# read", "investment case", "deep analysis/dive", "full/comprehensive
-# profile" should trigger the 10-section format with optional natural
-# lead-ins ("give me an", "I'd like a", "please prepare a", "do a").
-#
-# This regex is a `search()` (not anchored) so the trigger can sit
-# anywhere in the sentence. The follow-on word is consumed only when
-# present so we can extract the target cleanly.
-_TRIGGER_RE_FUZZY = re.compile(
-    r"\b"
-    r"(?:"
-    # Lead-ins (optional) — natural phrases an exec might type
-    r"(?:give\s+me|gimme|prepare|build|create|draft|do|i(?:'d|\s+would)?\s+like|"
-    r"i\s+(?:want|need)|please\s+(?:prepare|do|give|build|draft|create)|"
-    r"can\s+you\s+(?:prepare|do|give|build|draft|create))?"
-    r"\s*"
-    r"(?:an?|the)?\s*"
-    # Trigger phrases
-    r"(?:"
-    r"executive\s+(?:briefing|profile|summary)|"
-    r"strategic\s+(?:read|profile)|"
-    r"investment\s+case|"
-    r"deep\s+(?:analysis|dive)|"
-    r"comprehensive\s+(?:profile|briefing|overview)|"
-    r"full\s+profile|"
-    r"briefing|"
-    r"profile"
-    r")"
-    r"\s+(?:on|of|for|about|regarding)\s+"
+    r"deep\s+profile\s+(?:of|on|for|about)?\s*"  # deep profile of Apple
     r")",
     re.IGNORECASE,
 )
@@ -110,33 +66,17 @@ def is_deep_profile_request(user_question: str) -> Optional[str]:
     Examples:
       '/profile Apple'                 → 'Apple'
       'deep profile of Saudi Arabia'   → 'Saudi Arabia'
-      'executive briefing on Tim Cook' → 'Tim Cook'
-      'Give me an executive briefing on Apple' → 'Apple'  (Tier 3 c3)
-      'Investment case for Microsoft'  → 'Microsoft'      (Tier 3 c3)
-      'Strategic read on Aramco'       → 'Aramco'         (Tier 3 c3)
-      'how is Apple doing'             → None  (no trigger)
+      'give me a briefing on Siemens'  → None  (Jul21 company brief)
+      'company profile for Toyota'     → None
+      'CEO profile for Pfizer'         → None
+      'how is Apple doing'             → None
     """
     if not user_question:
         return None
-    # 1. Strict anchored pattern (original behaviour — kept first so
-    #    "/profile Apple" etc. extracts the target the same way).
     m = _TRIGGER_RE.match(user_question)
     if m:
         target = user_question[m.end():].strip().rstrip("?.!,").strip()
         return target or None
-    # 2. Fuzzy in-sentence pattern (Tier 3 commit 3). The match
-    #    consumes everything up to and including the preposition
-    #    (on/of/for/about/regarding), so the residue is the target.
-    m = _TRIGGER_RE_FUZZY.search(user_question)
-    if m:
-        target = user_question[m.end():].strip().rstrip("?.!,").strip()
-        # Sanity: avoid one-word junk like "it"/"this" — those are
-        # follow-up references that need conversation history, not
-        # a fresh deep-profile run.
-        if target and target.lower() not in {
-            "it", "this", "that", "them", "him", "her",
-        }:
-            return target
     return None
 
 
@@ -450,7 +390,16 @@ def compose_deep_profile(
         query += " — economic policy, FDI, regulatory updates"
     elif entity_type == "person":
         query += " — recent statements, role changes, initiatives"
-    web_results = web_search.search(query, max_results=5)
+    web_envelope = web_search.search_with_status(query, max_results=5)
+    web_results = list(web_envelope.get("results") or [])
+    if web_envelope.get("do_not_claim_zero"):
+        # Mark unavailable so curator uses [inferred] and does not claim
+        # "no web coverage" as a verified finding.
+        db["web_retrieval"] = {
+            "retrieval_status": web_envelope.get("retrieval_status"),
+            "do_not_claim_zero": True,
+            "error": web_envelope.get("error"),
+        }
 
     # 3. Build the prompt
     db_evidence_json = json.dumps(
@@ -461,6 +410,11 @@ def compose_deep_profile(
         },
         indent=2, default=str,
     )
+    try:
+        from app.services.prompt_masking import mask_text
+        db_evidence_json = mask_text(db_evidence_json)
+    except Exception:
+        pass
     web_evidence_text = web_search.format_for_prompt(web_results)
 
     user_msg = _DEEP_PROFILE_USER_TEMPLATE.format(
@@ -481,13 +435,20 @@ def compose_deep_profile(
     # into them; the validator knows.
     from app.services.style_guide import STYLE_GUIDE_PROMPT
     try:
-        resp = client.chat.completions.create(
-            model=ADVISORY_MODEL or OPENAI_MODEL,
+        from app.services.llm_residency import resolve_data_completion_client
+        # Use module-level ADVISORY_MODEL / OPENAI_MODEL — a local
+        # `from app.config import OPENAI_MODEL` here makes the name local
+        # for the whole function and blows up at _classify_target above.
+        data_client, data_model = resolve_data_completion_client(
+            client, preferred_model=ADVISORY_MODEL or OPENAI_MODEL,
+        )
+        resp = data_client.chat.completions.create(
+            model=data_model,
             messages=[
                 {"role": "system", "content": STYLE_GUIDE_PROMPT + "\n\n" + _DEEP_PROFILE_SYSTEM_PROMPT},
                 {"role": "user",   "content": user_msg},
             ],
-            temperature=0.2,  # low — we want grounded, not creative
+            **openai_determinism_kw(),
             **openai_max_completion_tokens_kw(),
         )
         answer = (resp.choices[0].message.content or "").strip()

@@ -310,10 +310,10 @@ def compose_document_answer(
 def _synthesize_document_briefing(question: str, evidence_blocks: list[str]) -> str:
     """Compose a STYLE_GUIDE briefing from document excerpts. Empty on failure."""
     try:
-        from app.database import get_openai_client
-        from app.config import ADVISORY_MODEL, OPENAI_MODEL, openai_max_completion_tokens_kw
+        from app.config import openai_max_completion_tokens_kw
         from app.services.style_guide import STYLE_GUIDE_PROMPT, HEADERS
-        client = get_openai_client()
+        from app.services.llm_residency import resolve_data_completion_client
+        client, model = resolve_data_completion_client()
         if client is None or not evidence_blocks:
             return ""
         evidence = "\n\n---\n\n".join(evidence_blocks[:8])
@@ -330,7 +330,6 @@ def _synthesize_document_briefing(question: str, evidence_blocks: list[str]) -> 
             f"QUESTION:\n{question.strip()}\n\n"
             f"EXCERPTS:\n{evidence}\n"
         )
-        model = ADVISORY_MODEL or OPENAI_MODEL
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],

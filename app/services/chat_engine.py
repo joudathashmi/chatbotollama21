@@ -67,7 +67,8 @@ from app.services.rate_limiter import RateLimiter
 # instead of `global_headquarters=<country>`. Extend as needed.
 _COUNTRY_ADJECTIVE_TO_NOUN: dict[str, str] = {
     "pakistani": "Pakistan", "indian": "India", "egyptian": "Egypt",
-    "chinese": "China", "japanese": "Japan", "korean": "Korea",
+    "chinese": "China", "japanese": "Japan", "korean": "South Korea",
+    "south korean": "South Korea",
     "french": "France", "german": "Germany", "british": "United Kingdom",
     "spanish": "Spain", "italian": "Italy", "russian": "Russia",
     "brazilian": "Brazil", "mexican": "Mexico", "canadian": "Canada",
@@ -561,7 +562,14 @@ def _top_similar_company_names(entity: str, k: int = 3) -> list[str]:
     try:
         conn = get_db()
         names = _fetch_names(conn)
-    except Exception:
+    except Exception as exc:
+        # Outage ≠ "no similar names". Callers that treat [] as
+        # "entity unknown" must check pack/_retrieval separately.
+        try:
+            from app.logger import logger as _log
+            _log.warning("similar_company_names UNAVAILABLE: %s", exc)
+        except Exception:
+            pass
         return []
 
     el = entity.strip().lower()
@@ -607,6 +615,14 @@ def _openai_exc_is_retryable(exc: BaseException) -> bool:
 
 
 def _chat_completions_create_with_retry(client: OpenAI, **kwargs):
+    # Mask PII/secrets in user/tool message content before egress.
+    # System prompts stay intact; business facts are not stripped.
+    try:
+        from app.services.prompt_masking import mask_messages_for_llm
+        if "messages" in kwargs and kwargs["messages"] is not None:
+            kwargs = {**kwargs, "messages": mask_messages_for_llm(kwargs["messages"])}
+    except Exception:
+        pass
     last_exc: BaseException | None = None
     for attempt in range(OPENAI_MAX_RETRIES):
         try:
@@ -649,6 +665,11 @@ def _structured_turn_log(payload: dict) -> None:
     # Read env vars at call time so monkeypatching works in tests.
     if os.getenv("MISA_LOG_TURNS", "").strip().lower() not in ("1", "true", "yes"):
         return
+    try:
+        from app.services.prompt_masking import mask_obj
+        payload = mask_obj(payload, for_log=True)
+    except Exception:
+        pass
     line = json.dumps(payload, ensure_ascii=False, default=str)
     path = (os.getenv("MISA_LOG_FILE") or "").strip()
     if path:
@@ -720,6 +741,35 @@ def _forced_smart_search_tool_result(user_question: str, pack: dict, *, limit: i
     if not terms:
         terms = _search_terms_from_question(user_question)
     df, sql, params = run_rhq_company_smart_search(terms, limit)
+    from app.database import smart_search_retrieval_failed, smart_search_failure_message
+    if smart_search_retrieval_failed(sql):
+        err = smart_search_failure_message(sql)
+        pack["_degraded"] = "smart_search_retrieval_failed"
+        pack["_retrieval"] = {
+            "retrieval_status": "SOURCE_UNAVAILABLE",
+            "source_name": "company_profiles.smart_search",
+            "do_not_claim_zero": True,
+            "counts_unavailable": True,
+            "error": err,
+        }
+        return {
+            "table": COMPANY_TABLE,
+            "filters": {
+                "_forced_retrieval_no_tool_call": terms,
+                "_db_error": err,
+                "_retrieval_status": "SOURCE_UNAVAILABLE",
+            },
+            "sql": sql,
+            "params": params,
+            "rows_df": df,
+            "row_count": None,  # never 0 on failure — not a verified empty
+            "input_trace": dict(pack),
+            "sql_entity_check_passed": False,
+            "row_entity_sanity_passed": False,
+            "closest_names": [],
+            "error": err,
+            "_retrieval_failed": True,
+        }
     entity = pack.get("entity_candidate")
     rows = df.to_dict(orient="records")
     row_sanity = True
@@ -866,15 +916,24 @@ def _is_strategic_policy_question(user_question: str) -> bool:
 # / "contact" are NOT in this list.
 
 _ADVISORY_QUESTION_PATTERNS = [
-    # "market fit" anywhere is the canonical advisory ask
-    re.compile(r"\bmarket\s+fit\b", re.I),
+    # "market fit" anywhere is the canonical advisory ask.
+    # "market for" is a very common typo / speech-to-text of "market fit"
+    # ("make me a market for to attract Indian companies").
+    re.compile(r"\bmarket\s+(fit|for)\b|\bfit\s+assessment\b", re.I),
+    # "make me a market … attract … companies" (typo-tolerant)
+    re.compile(
+        r"\bmake\s+(me\s+)?(a\s+)?market\b.{0,60}"
+        r"\bat+r+act",
+        re.I | re.DOTALL,
+    ),
     # attraction verbs + investment-like nouns ("attracting Indian
     # companies", "win Japanese investors", "bring FDI"). Verb suffix
     # forms are spelled out — 'targeted'/'attracting' failing to match
     # the bare stem is exactly how these questions kept leaking into
-    # the company disambiguator.
+    # the company disambiguator. Allow common double-letter typos
+    # (atrract / attracct).
     re.compile(
-        r"\b(attract(?:ing|ed|s)?|bring(?:ing|s)?|draw(?:ing|s)?|"
+        r"\b(at+r+act(?:ing|ed|s)?|bring(?:ing|s)?|draw(?:ing|s)?|"
         r"court(?:ing|ed|s)?|win(?:ning|s)?|captur(?:e|ing|ed|es)|"
         r"target(?:ing|ed|s)?|pursu(?:e|ing|ed|es))\b.{0,60}"
         r"\b(compan(?:y|ies)|invest(?:or|ors|ment|ments)|businesses|"
@@ -887,7 +946,7 @@ _ADVISORY_QUESTION_PATTERNS = [
         r"\b(compan(?:y|ies)|invest(?:or|ors)|firms|businesses|targets)\b"
         r".{0,40}\b(to|should|would|could|can|will|must)\s+"
         r"(we\s+|misa\s+|i\s+)?(be\s+)?"
-        r"(target(?:ing|ed)?|attract(?:ing|ed)?|"
+        r"(target(?:ing|ed)?|at+r+act(?:ing|ed)?|"
         r"pursu(?:e|ing|ed)|court(?:ing|ed)?|engag(?:e|ing|ed)|focus)",
         re.I | re.DOTALL,
     ),
@@ -946,6 +1005,21 @@ _ADVISORY_QUESTION_PATTERNS = [
         r"analysis|perspective|view)\b",
         re.I,
     ),
+    # Corridor / origin-market strategy without an explicit deliverable
+    # noun ("investment opportunities from Japan", "FDI strategy for
+    # Korea", "how can Saudi attract French manufacturers").
+    re.compile(
+        r"\b(fdi|foreign\s+direct\s+investment|outbound\s+invest|"
+        r"inbound\s+invest|investment\s+opportunit|"
+        r"market\s+entry|soft.?landing|localisation\s+partner)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(how\s+(can|should|do)\s+(saudi|ksa|misa|we)\b.{0,40}"
+        r"\bat+r+act)|"
+        r"\b(attract(?:ing)?\s+\w+\s+(?:compan|invest|firm))",
+        re.I | re.DOTALL,
+    ),
 ]
 
 # Count / browse questions must keep their deterministic routes even if
@@ -967,6 +1041,18 @@ def _detect_origin_country(user_question: str) -> str | None:
             continue
         if re.search(rf"\b{re.escape(adj)}\b", q):
             return noun
+    # 1b. Bare "US" / "U.S" as a market label — NOT the pronoun "us".
+    # Require a market noun after it (companies/firms/…) or a from-phrase.
+    if re.search(
+        r"\b(?:u\.?s\.?a?\.?)\s+"
+        r"(?:compan(?:y|ies)|firms?|corporations?|investors?|"
+        r"businesses|enterprises?|market|mncs?|smes?)\b",
+        q,
+    ) or re.search(
+        r"\b(?:from|in|of)\s+(?:the\s+)?u\.?s\.?a?\.?\b",
+        q,
+    ):
+        return "United States"
     # 2. Short aliases — abbreviations not in CANONICAL_COUNTRIES
     #    ("usa", "uk", "uae", "america"). Whole-word match only.
     for alias, noun in _COUNTRY_SHORT_ALIASES.items():
@@ -1007,6 +1093,19 @@ def _is_advisory_question(user_question: str) -> bool:
     if (_detect_advisory_deliverable(q) != "strategy_analysis"
             and _detect_origin_country(q)):
         return True
+    # Origin market + investment language → Jul21 advisory, not thin GK
+    # or a country overview dump. Skip pure "tell me about Germany".
+    try:
+        from app.services.jul21_surface import looks_like_corridor_investment_ask
+        if looks_like_corridor_investment_ask(q):
+            if not re.search(
+                r"(?i)^\s*(tell\s+me\s+about|what\s+about|overview\s+of|"
+                r"profile\s+of)\s+",
+                q,
+            ):
+                return True
+    except Exception:
+        pass
     return False
 
 
@@ -1021,7 +1120,26 @@ _ADVISORY_DELIVERABLE_PATTERNS: list[tuple[str, re.Pattern]] = [
         r"\broad\s*map\b|\bcampaign\b|"
         r"\b(develop|create|build|make|draft|prepare|design)\b"
         r".{0,30}\bplan\b|"
-        r"\bplan\s+(for|to)\s+attract",
+        r"\bplan\s+(for|to)\s+at+r+act",
+        re.I | re.DOTALL,
+    )),
+    # Market-fit BEFORE company-targeting so "make me a market for to
+    # attract Indian companies" is a strategy assessment, not a ranking.
+    ("market_fit", re.compile(
+        r"\bmarket\s+(fit|for)\b|\bfit\s+assessment\b|"
+        r"\bmake\s+(me\s+)?(a\s+)?market\b.{0,80}\bat+r+act|"
+        r"\bmarket\s+(entry|attraction)\s+strateg",
+        re.I | re.DOTALL,
+    )),
+    # Company-list + investment thesis (before sector_priorities so
+    # "best companies … thesis" does not become a sector essay).
+    ("company_targeting", re.compile(
+        r"\b(investment\s+thesis|theses)\b|"
+        r"\b(best|top|priority|target)\s+compan(?:y|ies)\b.{0,80}\b"
+        r"(from|in|of)\b|"
+        r"\bcompan(?:y|ies)\s+to\s+(?:be\s+)?(?:target|prioriti[sz]e|"
+        r"at+r+act|engage)\b|"
+        r"\btarget(?:ed|ing)?\s+(?:list|companies)\b",
         re.I | re.DOTALL,
     )),
     ("sector_priorities", re.compile(
@@ -1029,9 +1147,6 @@ _ADVISORY_DELIVERABLE_PATTERNS: list[tuple[str, re.Pattern]] = [
         r"\b(which|what)\s+sectors?\b|"
         r"\bsectors?\s+.{0,30}\b(focus|prioriti[sz]e|target)\b",
         re.I | re.DOTALL,
-    )),
-    ("market_fit", re.compile(
-        r"\bmarket\s+fit\b|\bfit\s+assessment\b", re.I,
     )),
 ]
 
@@ -1077,34 +1192,113 @@ def _advisory_country_context(user_question: str) -> dict | None:
     try:
         from app.services.engagement_data import fetch_country_saudi_investors
         stats = fetch_country_saudi_investors(country)
-        ctx["companies_from_origin_licensed_in_saudi"] = stats.get(
-            "total_licensed")
-        ctx["companies_from_origin_with_rhq"] = stats.get("total_rhq")
-        ctx["top_rhq_companies"] = [
-            {"name": r.get("company_name"), "industry": r.get("industry"),
-             "annual_revenue": r.get("annual_revenue")}
-            for r in (stats.get("rhq") or [])[:8]
-        ]
-        ctx["top_licensed_companies"] = [
-            {"name": r.get("company_name"), "industry": r.get("industry"),
-             "annual_revenue": r.get("annual_revenue")}
-            for r in (stats.get("licensed_only") or [])[:8]
-        ]
-    except Exception:
+        if stats.get("_db_error"):
+            # DB/schema failure — NEVER pass zeros (model invents
+            # "0 Indian companies licensed" from them).
+            ctx["footprint_data_unavailable"] = True
+            ctx["retrieval_status"] = (
+                stats.get("retrieval_status")
+                or "SOURCE_UNAVAILABLE"
+            )
+            ctx["_db_error"] = stats.get("_db_error")
+            ctx["retrieval"] = stats.get("retrieval") or {
+                "retrieval_status": ctx["retrieval_status"],
+                "counts_unavailable": True,
+                "do_not_claim_zero": True,
+                "error": stats.get("_db_error"),
+            }
+            try:
+                from app.logger import logger as _log
+                _log.warning(
+                    "advisory_footprint UNAVAILABLE country=%r err=%s",
+                    country, stats.get("_db_error"),
+                )
+            except Exception:
+                pass
+        elif (
+            int(stats.get("total_licensed") or 0) == 0
+            and int(stats.get("total_rhq") or 0) == 0
+        ):
+            ctx["companies_from_origin_licensed_in_saudi"] = 0
+            ctx["companies_from_origin_with_rhq"] = 0
+            ctx["retrieval_status"] = "SUCCESS_EMPTY"
+            ctx["retrieval_filters"] = {
+                "origin_country": country,
+                "source": "company_profiles + nationality/origin join",
+            }
+            ctx["top_rhq_companies"] = []
+            ctx["top_licensed_companies"] = []
+            ctx["expansion_targets"] = []
+        else:
+            ctx["companies_from_origin_licensed_in_saudi"] = stats.get(
+                "total_licensed")
+            ctx["companies_from_origin_with_rhq"] = stats.get("total_rhq")
+            ctx["retrieval_status"] = (
+                stats.get("retrieval_status") or "SUCCESS_WITH_RESULTS"
+            )
+            ctx["retrieval_filters"] = {
+                "origin_country": country,
+                "source": "company_profiles.licensed / is_rhq",
+            }
+            if stats.get("retrieval"):
+                ctx["retrieval"] = stats["retrieval"]
+            elif stats.get("retrieval_status"):
+                ctx["retrieval"] = {
+                    "retrieval_status": stats["retrieval_status"],
+                    "source_name": "company_profiles.licensed/is_rhq",
+                    "record_count": int(stats.get("total_licensed") or 0),
+                }
+            ctx["top_rhq_companies"] = [
+                {"name": r.get("company_name"), "industry": r.get("industry"),
+                 "annual_revenue": r.get("annual_revenue")}
+                for r in (stats.get("rhq") or [])[:8]
+            ]
+            ctx["top_licensed_companies"] = [
+                {"name": r.get("company_name"), "industry": r.get("industry"),
+                 "annual_revenue": r.get("annual_revenue")}
+                for r in (stats.get("licensed_only") or [])[:8]
+            ]
+            try:
+                from app.services.target_ranking import rank_expansion_targets
+                from app.logger import logger as _log
+                expansion = rank_expansion_targets(stats)
+                ctx["expansion_targets"] = expansion
+                _log.info(
+                    "advisory_footprint country=%r licensed=%s rhq=%s "
+                    "expansion_targets=%s",
+                    country,
+                    ctx.get("companies_from_origin_licensed_in_saudi"),
+                    ctx.get("companies_from_origin_with_rhq"),
+                    len(expansion),
+                )
+            except Exception:
+                pass
+    except Exception as exc:
         # DB unreachable — MISSING data must never masquerade as ZERO.
-        # Without this flag the model reads absent counts as "no
-        # companies licensed" and confidently reports a false zero.
         ctx["footprint_data_unavailable"] = True
+        ctx["retrieval_status"] = "SOURCE_UNAVAILABLE"
+        ctx["_db_error"] = str(exc)
+        ctx["retrieval"] = {
+            "retrieval_status": "SOURCE_UNAVAILABLE",
+            "counts_unavailable": True,
+            "do_not_claim_zero": True,
+            "error": str(exc),
+        }
     # Sector distribution — DB evidence for "which sectors convert".
     try:
         from app.services.engagement_data import (
             fetch_country_sector_distribution,
         )
         dist = fetch_country_sector_distribution(country)
-        if dist:
-            ctx["licensed_sector_distribution"] = dist
-    except Exception:
-        pass
+        if dist.get("_db_error"):
+            ctx["sector_distribution_unavailable"] = True
+            ctx["_sector_db_error"] = dist.get("_db_error")
+            ctx["sector_retrieval_status"] = dist.get("retrieval_status")
+        elif dist.get("sectors"):
+            ctx["licensed_sector_distribution"] = dist["sectors"]
+    except Exception as exc:
+        ctx["sector_distribution_unavailable"] = True
+        ctx["_sector_db_error"] = str(exc)
     # Country-level intelligence (vision outlook + strategic
     # opportunities captured by MISA analysts) — the insight layer
     # that keeps the report from reading like generic market prose.
@@ -1659,7 +1853,7 @@ def _try_top_companies_per_sector_direct(
         for s in sectors_with_data:
             cur.execute("""
                 SELECT cp.company_name, cp.annual_revenue, cp.market_cap,
-                       cp.role, cp.registration_type
+                       cp.role, cp.licensed, cp.is_rhq
                 FROM company_profiles cp
                 JOIN sectors s ON cp.sector_id = s.id
                 WHERE s.name = %s
@@ -1670,14 +1864,9 @@ def _try_top_companies_per_sector_direct(
                 LIMIT 10
             """, (s["sector_name"],))
             for r in cur.fetchall():
-                # Licensing status derived from role / registration_type
-                # (the is_rhq / licensed booleans are unreliable).
-                _role = r.get("role")
-                _is_licensed = _role == "Licensed Entity"
-                _is_rhq = (
-                    (_is_licensed and r.get("registration_type") == "RHQ")
-                    or _role == "RHQ Entity"
-                )
+                # Canonical licensing markers: licensed / is_rhq booleans.
+                _is_licensed = bool(r.get("licensed"))
+                _is_rhq = bool(r.get("is_rhq"))
                 rows.append({
                     "sector": s["sector_name"],
                     "sector_company_count_in_db": s["company_count"],
@@ -1766,6 +1955,7 @@ def _try_sector_aggregation_direct(
 
     pack["_sector_aggregation_mode"] = True
     pack["_sector_aggregation_count"] = len(rows)
+    pack["_sector_aggregation_rows"] = rows
 
     # Build a single synthetic tool_call shaped like the rest of the
     # pipeline expects. The curator sees this as one table of rows
@@ -1777,6 +1967,109 @@ def _try_sector_aggregation_direct(
         pack,
     )]
 
+
+def _format_sector_opportunity_briefing(rows: list[dict]) -> str:
+    """Deterministic Jul21-lite sector activity brief from opportunity counts.
+
+    Avoids thin textbook GK when the curator compresses aggregation rows.
+    """
+    total = sum(int(r.get("opportunity_count") or 0) for r in rows)
+    lines = [
+        "# Sector Opportunity Priorities (MISA pipeline)",
+        "",
+        "## Strategic Context",
+        "",
+        "MISA's live opportunities pipeline is the evidence base for where "
+        "investment-attraction capacity is converting today. The ranking "
+        "below is ordered by opportunity count in the MISA database — use "
+        "it to prioritise desk coverage, roadshows, and account targeting "
+        "against Vision 2030 demand anchors (SDAIA / LEAP for digital, "
+        "NUPCO for health, NEOM and industrial zones for localisation).",
+        "",
+        f"**{len(rows)} sectors** carry tagged opportunities "
+        f"(**{total:,}** opportunities in total in this cut).",
+        "",
+        "## Sector Ranking",
+        "",
+        "| Rank | Sector | MISA opportunities | Priority | Saudi demand anchor |",
+        "|---|---|---|---|---|",
+    ]
+    # Simple demand-anchor heuristic by sector keywords
+    def _anchor(sector: str) -> str:
+        s = (sector or "").casefold()
+        if any(k in s for k in ("ict", "tech", "digital", "software", "telecom")):
+            return "SDAIA / LEAP"
+        if any(k in s for k in ("health", "pharma", "life", "bio")):
+            return "NUPCO / localisation"
+        if any(k in s for k in ("energy", "oil", "gas", "power", "renew", "water")):
+            return "NEOM / energy transition"
+        if any(k in s for k in ("construct", "infra", "real estate", "engineer")):
+            return "Giga-projects / NIDLP"
+        if any(k in s for k in ("financ", "bank", "insur")):
+            return "Financial sector development"
+        if any(k in s for k in ("tour", "hospital", "entertain")):
+            return "Tourism / entertainment vision"
+        if any(k in s for k in ("agro", "food", "agricult")):
+            return "Food security / NIDLP"
+        if any(k in s for k in ("petro", "chem", "mining", "metal")):
+            return "Industrial / PIF zones"
+        return "Vision 2030 sector programme"
+
+    for i, r in enumerate(rows[:15], 1):
+        sector = str(r.get("sector_name") or "—")
+        count = int(r.get("opportunity_count") or 0)
+        priority = "Tier 1" if i <= 5 else ("Tier 2" if i <= 10 else "Tier 3")
+        lines.append(
+            f"| {i} | {sector} | {count:,} | {priority} | {_anchor(sector)} |"
+        )
+
+    # Jul21 depth: numbered deep-dives for every Tier-1 sector.
+    lines += ["", "## Tier-1 Sector Deep-Dives", ""]
+    for i, r in enumerate(rows[:5], 1):
+        sector = str(r.get("sector_name") or "sector")
+        count = int(r.get("opportunity_count") or 0)
+        anchor = _anchor(sector)
+        lines += [
+            f"### {i}. {sector}",
+            "",
+            f"**Why it ranks.** MISA's opportunities table carries "
+            f"**{count:,}** tagged opportunities in {sector} — evidence "
+            f"that attraction capacity is converting in this corridor.",
+            "",
+            f"**Saudi demand driver.** Anchor outreach to **{anchor}** "
+            f"and name the concrete buyer / programme in every account "
+            f"conversation.",
+            "",
+            f"**MISA plays.** (1) Desk sprint on the top opportunity "
+            f"accounts within 90 days. (2) Pair each account with a "
+            f"named Saudi counterpart under {anchor}. (3) Use LEAP / "
+            f"FII / sector exhibitions as commitment forcing functions.",
+            "",
+        ]
+
+    lines += [
+        "",
+        "## Recommended Next Actions for MISA",
+        "",
+    ]
+    for r in rows[:5]:
+        sector = str(r.get("sector_name") or "sector")
+        count = int(r.get("opportunity_count") or 0)
+        lines.append(
+            f"- Stand up a **{sector}** desk sprint on the top "
+            f"opportunity accounts ({count:,} tagged) — map each to a "
+            f"named Saudi demand anchor ({_anchor(sector)}) and a 90-day "
+            f"outreach calendar."
+        )
+    lines += [
+        "- Publish a one-pager of this ranking for IPA / chamber briefings "
+        "ahead of LEAP / FII.",
+        "- Flag any Tier-1 sector with thin RHQ coverage for conversion plays.",
+        "",
+        "_Source: MISA `opportunities` aggregated by `sector_name`._",
+        "",
+    ]
+    return "\n".join(lines)
 
 def _detect_ambiguous_candidates(rows: list[dict], entity: str) -> list[dict] | None:
     """Detect when smart-search returned multiple DISTINCT companies
@@ -1904,6 +2197,25 @@ def _compose_local_commentary(
     *,
     response_locale: str = "en",
 ) -> str:
+    """Compose then run the shared finalize gate (one voice, all paths)."""
+    raw = _compose_local_commentary_raw(
+        tool_calls_executed, user_question, pack,
+        response_locale=response_locale,
+    )
+    try:
+        from app.services.answer_finalize import finalize_answer
+        return finalize_answer(raw, user_question=user_question, pack=pack)
+    except Exception:
+        return raw
+
+
+def _compose_local_commentary_raw(
+    tool_calls_executed: list,
+    user_question: str,
+    pack: dict,
+    *,
+    response_locale: str = "en",
+) -> str:
     # COUNT-only short-circuit: if every successful tool call is a
     # count-only result, render a deterministic answer without calling
     # OpenAI. Saves a round-trip and is 100% accurate / consistent.
@@ -1978,7 +2290,11 @@ def _compose_local_commentary(
     # answer is unchanged.
     try:
         from app.services.curation import cap_rows_for_turn
-        merged_rows, _ = cap_rows_for_turn(merged_rows, context="chat_engine.merged_rows")
+        merged_rows, _was_trunc = cap_rows_for_turn(
+            merged_rows, context="chat_engine.merged_rows")
+        if _was_trunc:
+            pack["_truncated"] = True
+            pack["_truncation_reason"] = "row_budget"
     except Exception:
         pass
 
@@ -2002,22 +2318,48 @@ def _compose_local_commentary(
             and not _is_self_reference_entity(entity)):
         candidates = _detect_ambiguous_candidates(merged_rows, entity)
         if candidates:
-            ent_clean = entity.strip()
-            cand_lines = "\n".join(
-                f"  - **{c['name']}**" +
-                (f" (HQ {c['hq']})" if c.get("hq") else "") +
-                (f" — {c['sector']}" if c.get("sector") else "")
-                for c in candidates
-            )
-            return (
-                f"## Multiple possible matches for \"{ent_clean}\"\n\n"
-                f"I found several records that could match your query. "
-                f"Please tell me which one you meant:\n\n"
-                f"{cand_lines}\n\n"
-                f"_Reply with the exact name and I'll pull the full "
-                f"profile, including FK-linked AI insights, executives, "
-                f"and MENA presence._"
-            )
+            # Full company-profile asks: auto-pick the top candidate and
+            # continue — don't ship a clarification stub as the answer.
+            if re.search(
+                r"(?i)\b(company\s+(?:profile|briefing)|"
+                r"briefing\s+on|profile\s+of|"
+                r"tell\s+me\s+about|brief\s+me\s+on)\b",
+                user_question or "",
+            ):
+                top_name = (candidates[0] or {}).get("name") or ""
+                if top_name:
+                    pack["_auto_picked_ambiguous"] = top_name
+                    pack["entity_candidate"] = top_name
+                    # Keep only rows for the top distinct company (fuzzy).
+                    top_key = _name_key_for_dedup(top_name)
+                    filtered = [
+                        r for r in merged_rows
+                        if _name_key_for_dedup(
+                            str(r.get("company_name") or r.get("name") or "")
+                        ) == top_key
+                        or top_name.casefold() in str(
+                            r.get("company_name") or r.get("name") or ""
+                        ).casefold()
+                    ]
+                    if filtered:
+                        merged_rows = filtered
+            else:
+                ent_clean = entity.strip()
+                cand_lines = "\n".join(
+                    f"  - **{c['name']}**" +
+                    (f" (HQ {c['hq']})" if c.get("hq") else "") +
+                    (f" — {c['sector']}" if c.get("sector") else "")
+                    for c in candidates
+                )
+                return (
+                    f"## Multiple possible matches for \"{ent_clean}\"\n\n"
+                    f"I found several records that could match your query. "
+                    f"Please tell me which one you meant:\n\n"
+                    f"{cand_lines}\n\n"
+                    f"_Reply with the exact name and I'll pull the full "
+                    f"profile, including FK-linked AI insights, executives, "
+                    f"and MENA presence._"
+                )
 
     # Auto-enrich primary rows with FK-linked supplementary tables
     # (company_ai_insights, executives, competitors, country_insights,
@@ -2034,36 +2376,145 @@ def _compose_local_commentary(
     except Exception:
         pass  # enrichment is best-effort
 
-    # 1) Rows found → always curate insights via OpenAI on privacy-filtered rows.
+    # 1) Rows found → Jul21 path first: Azure/OpenAI narrative over
+    #    privacy-filtered fact cards (MISA_NARRATIVE_CLOUD). Deterministic
+    #    templates are fallback only when curation fails / is disabled.
     if merged_rows and CHAT_CURATION_ENABLED:
         client = get_openai_client()
         if client is not None:
-            insight = curate_company_insights(
+            try:
+                insight = curate_company_insights(
+                    merged_rows,
+                    user_question,
+                    locale=response_locale,
+                    entity_candidate=entity,
+                    entity_matched=entity_matched,
+                    table=primary_table,
+                    client=client,
+                    model=OPENAI_MODEL,
+                    intent=pack.get("_intent"),
+                    depth=pack.get("_depth"),
+                )
+                if insight:
+                    pack["_answer_source"] = "curated"
+                    # Person briefs: layer question-only / web Background under
+                    # ## Background (Role stays MISA-authoritative). Matches
+                    # Jul21 person-brief richness without sending DB JSON to web.
+                    try:
+                        import re as _re
+                        if _re.search(r"(?m)^##\s+Role\b", insight or ""):
+                            from app.services.hybrid_briefing import enrich_db_briefing
+                            enriched = enrich_db_briefing(
+                                insight,
+                                user_question,
+                                entity_hint=entity or entity_matched or "",
+                                include_docs=False,
+                                include_web=True,
+                            )
+                            if enriched.get("answer"):
+                                insight = enriched["answer"]
+                                pack["_answer_source"] = "curated+public_bg"
+                                if enriched.get("web_sources"):
+                                    pack["_web_sources"] = enriched["web_sources"]
+                    except Exception:
+                        pass
+                    # DURABLE CONTRACT GATE: if curated narrative is thin /
+                    # wrong shape, fall through to deterministic templates
+                    # instead of shipping a regression (ops-less Apple brief,
+                    # Role-only CEO, etc.).
+                    try:
+                        from app.services.answer_contracts import soft_check_answer
+                        from app.logger import logger as _log
+                        try:
+                            _viol = soft_check_answer(
+                                insight,
+                                intent=pack.get("_intent"),
+                                user_question=user_question,
+                                db_context=pack.get("_advisory_db_context")
+                                or pack.get("_db_context"),
+                            )
+                        except Exception as _sc_exc:
+                            # Fail closed — never ship past a broken gate.
+                            _viol = [f"soft_check_exception:{type(_sc_exc).__name__}"]
+                            _log.warning(
+                                "answer_contract: soft_check raised %s — "
+                                "falling back to templates",
+                                _sc_exc,
+                            )
+                        if _viol:
+                            pack["_contract_violations"] = _viol
+                            _log.warning(
+                                "answer_contract: curated shape failed %s — "
+                                "falling back to templates",
+                                _viol,
+                            )
+                            insight = None
+                    except Exception:
+                        insight = None
+                    if insight:
+                        # A successful answer makes per-tool-call error hints
+                        # internal plumbing — showing "I couldn't look up X in
+                        # `fdi_data`" above a correct answer reads broken in
+                        # production. The raw errors stay in the tool_call
+                        # trace for debug mode.
+                        return insight
+            except Exception:
+                pass
+        try:
+            from app.services.db_briefing import render_db_briefing
+            db_brief = render_db_briefing(
                 merged_rows,
-                user_question,
-                locale=response_locale,
-                entity_candidate=entity,
-                entity_matched=entity_matched,
-                table=primary_table,
-                client=client,
-                model=OPENAI_MODEL,
                 intent=pack.get("_intent"),
-                depth=pack.get("_depth"),
+                table=primary_table,
+                user_question=user_question,
+                locale=response_locale,
+                force=True,
             )
-            if insight:
-                # A successful answer makes per-tool-call error hints
-                # internal plumbing — showing "I couldn't look up X in
-                # `fdi_data`" above a correct answer reads broken in
-                # production. The raw errors stay in the tool_call
-                # trace for debug mode.
-                return insight
+            if db_brief:
+                try:
+                    from app.services.hybrid_briefing import enrich_db_briefing
+                    enriched = enrich_db_briefing(
+                        db_brief,
+                        user_question,
+                        entity_hint=entity or "",
+                    )
+                    if enriched.get("answer"):
+                        pack["_answer_source"] = "hybrid_db"
+                        pack["_db_briefing"] = "deterministic+web+docs"
+                        if enriched.get("web_sources"):
+                            pack["_web_sources"] = enriched["web_sources"]
+                        if enriched.get("doc_sources"):
+                            pack["_doc_sources"] = enriched["doc_sources"]
+                        return enriched["answer"]
+                except Exception:
+                    pass
+                pack["_answer_source"] = "db"
+                pack["_db_briefing"] = "deterministic"
+                return db_brief
+        except Exception:
+            pass
 
-    # 2) No rows in the DB → fall back to OpenAI general knowledge (labelled).
-    # ALSO triggers when the only output we'd otherwise have is a
-    # friendly tool-error message: a generic GK answer is more useful
-    # than "I had trouble pulling data" alone. The error stays in the
-    # debug trace either way.
+    # 2) No rows in the DB → prefer Jul21 advisory for corridor asks,
+    # else labelled general knowledge.
     if not merged_rows and CHAT_FALLBACK_ENABLED:
+        try:
+            from app.services.jul21_surface import looks_like_corridor_investment_ask
+            if looks_like_corridor_investment_ask(user_question):
+                _client = get_openai_client()
+                if _client is not None:
+                    adv = _run_advisory_path(
+                        user_question,
+                        pack,
+                        response_locale or "en",
+                        response_locale or "en",
+                        _client,
+                    )
+                    if adv and adv.get("answer") and "Response withheld" not in (
+                        adv.get("answer") or ""
+                    ):
+                        return adv["answer"]
+        except Exception:
+            pass
         client = get_openai_client()
         if client is not None:
             answer = general_knowledge_answer(
@@ -2300,14 +2751,17 @@ def _is_forward_looking_exec_question(question: str) -> bool:
 # Current government / cabinet office-holder questions. The company_executives
 # table lags royal decrees (e.g. Saudi Investment Minister changed Feb 2026).
 # These MUST be web-verified; DB rows are supporting context only.
+# Public / cabinet officeholders — NOT private-company C-suite.
+# "Who is the CEO of Apple?" must stay on MISA company_executives;
+# "Who is the Minister of Investment?" must prefer live web.
 _CURRENT_OFFICEHOLDER_RE = re.compile(
     r"(?ix)"
     r"(?:"
     r"\bwho\s+(?:is|are)\s+(?:the\s+)?"
     r"(?:current\s+|acting\s+|incumbent\s+)?"
     r"(?:saudi\s+(?:arabian?\s+)?)?"
-    r"(?:minister|deputy\s+minister|secretary|governor|chairman|chair|"
-    r"president|ceo|head|director\s+general)\b"
+    r"(?:minister|deputy\s+minister|secretary|governor|"
+    r"director\s+general)\b"
     r"|"
     r"\b(?:current|incumbent|acting)\s+"
     r"(?:saudi\s+(?:arabian?\s+)?)?"
@@ -2328,6 +2782,9 @@ def _is_current_officeholder_question(question: str) -> bool:
     Stale MISA executive rows have repeatedly answered these incorrectly
     (e.g. naming a former Minister of Investment as current). Live web
     must lead; the DB is demoted to supporting context.
+
+    Corporate C-suite asks (CEO/CFO of Apple, Aramco, etc.) are NOT
+    officeholder questions — ``company_executives`` is authoritative.
     """
     return bool(_CURRENT_OFFICEHOLDER_RE.search(question or ""))
 
@@ -2399,17 +2856,34 @@ def _extract_exec_target(user_question: str, client, model: str) -> dict:
 # table entirely, going straight to a deterministic count + breakdown
 # from the canonical company_profiles.licensed / is_rhq flags. Catches
 # "how many RHQ licences do we have?", "total licensed companies in
-# saudi", "how many rhq", etc. The regex is tolerant of typos like
-# "licens" / "licence" / "license".
+# saudi", "how many rhq", "tell me the active MISA licenses", etc.
+# The regex is tolerant of typos like "licens" / "licence" / "license".
+# IMPORTANT: do NOT route these to `rhq_licenses` (small auxiliary table
+# ~661 rows) — that path returns 0 rows / "no reliable information".
 _SAUDI_LICENSING_COUNT_RE = re.compile(
+    r"(?:"
+    # Explicit count asks
     r"\b(how\s+many|count|total|number\s+of)\b.{0,40}\b"
-    r"(rhq|licen[cs]e?d?|licen[cs]es?|licensing)\b",
+    r"(rhq|licen[cs]e?d?|licen[cs]es?|licensing)\b"
+    r"|"
+    # "active/current MISA licenses", "tell me the active MISA licences"
+    r"\b(active|current)\s+(misa\s+)?(rhq\s+)?licen[cs]e?s?\b"
+    r"|"
+    r"\b(misa\s+)?(rhq\s+)?licen[cs]e?\s+(count|total|numbers?|snapshot)\b"
+    r")",
     re.IGNORECASE,
 )
 
 
 def _is_saudi_licensing_count_question(question: str) -> bool:
-    return bool(_SAUDI_LICENSING_COUNT_RE.search(question or ""))
+    q = question or ""
+    if not _SAUDI_LICENSING_COUNT_RE.search(q):
+        return False
+    # Keep country company-list asks on their own path
+    # ("tell me the Indian active companies").
+    if _is_country_company_list_question(q):
+        return False
+    return True
 
 
 # "list / show / tell me the <country> [active|licensed|rhq] companies" —
@@ -2435,12 +2909,53 @@ def _is_country_company_list_question(question: str) -> bool:
 def _format_country_licensing_answer(country: str, stats: dict) -> str:
     """Direct, deterministic answer to 'how many licensed / RHQ
     companies from <country>' — states the country's own numbers
-    instead of the global aggregate."""
+    instead of the global aggregate.
+
+    NEVER renders zeros when retrieval failed (`_db_error` /
+    counts_unavailable) — that was the India false-zero class.
+    """
+    if stats.get("_db_error") or (
+        isinstance(stats.get("retrieval"), dict)
+        and stats["retrieval"].get("do_not_claim_zero")
+    ) or stats.get("footprint_data_unavailable"):
+        err = stats.get("_db_error") or (
+            (stats.get("retrieval") or {}).get("error")
+        ) or "unknown"
+        status = (
+            stats.get("retrieval_status")
+            or (stats.get("retrieval") or {}).get("retrieval_status")
+            or "SOURCE_UNAVAILABLE"
+        )
+        return (
+            f"## {country}-origin companies in Saudi Arabia\n\n"
+            f"Internal MISA footprint data for **{country}** could not be "
+            f"retrieved (`{status}`"
+            + (f": {err}" if err and err != "unknown" else "")
+            + "). This is **not** a verified zero — do not conclude that "
+            "no licensed or RHQ companies exist.\n\n"
+            "_Source: `company_profiles.licensed` / `is_rhq` (unavailable)._"
+        )
+
     licensed    = int(stats.get("total_licensed") or 0)
     rhq         = int(stats.get("total_rhq") or 0)
     non_lic     = int(stats.get("total_non_licensed") or 0)
     non_lic_rhq = int(stats.get("total_non_licensed_rhq") or 0)
     total       = licensed + non_lic
+
+    if (
+        licensed == 0 and rhq == 0
+        and stats.get("retrieval_status") in (
+            "SUCCESS_EMPTY", "zero_records",
+        )
+    ):
+        return (
+            f"## {country}-origin companies in Saudi Arabia\n\n"
+            f"The queried MISA source returned **0** verified licensed "
+            f"records and **0** RHQ records for **{country}** "
+            f"(source: `company_profiles.licensed` / `is_rhq`; "
+            f"origin filters applied). This is a successful empty "
+            f"result, not a retrieval failure.\n"
+        )
 
     if non_lic:
         rhq_note = (
@@ -2480,6 +2995,53 @@ def _format_country_licensing_answer(country: str, stats: dict) -> str:
             name = r.get("company_name") or "—"
             ind = r.get("industry")
             lines.append(f"- **{name}**" + (f" — {ind}" if ind else ""))
+
+    # Jul21-lite closing: country-correct trade bodies + named next moves
+    # so count answers are not a bare census.
+    try:
+        from app.services.advisory_structured import _default_trade_bodies
+        bodies = _default_trade_bodies(country)[:5]
+        if bodies:
+            lines += [
+                "",
+                "## Investment & Trade Bodies to Engage",
+                "",
+                "| Organisation | Type | Role in engagement |",
+                "|---|---|---|",
+            ]
+            for b in bodies:
+                lines.append(
+                    f"| {b.get('organisation')} | {b.get('type')} | "
+                    f"{b.get('role')} |"
+                )
+        lead_names = []
+        for r in (tops or [])[:3]:
+            n = r.get("company_name")
+            if n:
+                lead_names.append(str(n))
+        lines += ["", "## Recommended Next Moves for MISA"]
+        if lead_names:
+            lines.append(
+                f"- Run RHQ expansion account reviews with "
+                f"**{lead_names[0]}**"
+                + (f" and **{lead_names[1]}**" if len(lead_names) > 1 else "")
+                + " — map Vision 2030 / giga-project demand (NEOM, SDAIA, "
+                "NUPCO as relevant)."
+            )
+        ipa = (bodies[0].get("organisation") if bodies else None) or (
+            f"the national IPA of {country}"
+        )
+        lines.append(
+            f"- Brief **{ipa}** on Saudi corridor offers for the top "
+            f"licensed/{country} RHQ accounts above."
+        )
+        lines.append(
+            f"- Publish a one-pager of the **{licensed:,}** licensed / "
+            f"**{rhq:,}** RHQ footprint for desk targeting ahead of LEAP / FII."
+        )
+    except Exception:
+        pass
+
     lines += ["", "_Source: licensed companies keyed by shareholder\\_country\\_name; "
               "unlicensed companies keyed by country\\_profile\\_name._"]
     return "\n".join(lines)
@@ -2505,12 +3067,32 @@ def _format_saudi_licensing_briefing(summary: dict, focus: str = "both") -> str:
     """Deterministic executive briefing for the RHQ / licensing-count
     question. No LLM — counts are exact and the structure is fixed.
     `focus` decides which number leads the answer so 'how many licenses'
-    and 'how many RHQ licenses' get the right headline."""
+    and 'how many RHQ licenses' get the right headline.
+
+    Never renders zeros when retrieval failed (`_db_error` /
+    counts_unavailable).
+    """
+    if summary.get("_db_error") or summary.get("counts_unavailable") or (
+        isinstance(summary.get("retrieval"), dict)
+        and summary["retrieval"].get("do_not_claim_zero")
+    ):
+        try:
+            from app.schemas.quality_response import licensing_fallback_message
+            return licensing_fallback_message(
+                status=summary.get("retrieval_status") or "SOURCE_UNAVAILABLE",
+                error=str(summary.get("_db_error") or "")[:200],
+            )
+        except Exception:
+            return (
+                "## Licensing Snapshot\n\n"
+                "Internal MISA licensing aggregates could not be retrieved. "
+                "This is **not** a verified zero.\n"
+            )
+
     total_lic = summary.get("total_licensed") or 0
     total_rhq = summary.get("total_rhq") or 0
     rhq_rows = summary.get("rhq_by_country") or []
     lic_rows = summary.get("licensed_by_country") or []
-
     # Build the RHQ-by-country table. Drop "Other / Unspecified" from
     # the headline view but mention it in a footer line so the totals
     # reconcile.
@@ -2529,7 +3111,13 @@ def _format_saudi_licensing_briefing(summary: dict, focus: str = "both") -> str:
     top3_pct = round(100 * top3 / total_rhq, 1) if total_rhq else 0
 
     lines: list[str] = []
-    lines.append("## Saudi RHQ & Licensing — Snapshot")
+    if focus == "licensed":
+        title = "## Licensing Snapshot"
+    elif focus == "rhq":
+        title = "## Saudi RHQ Snapshot"
+    else:
+        title = "## Licensing & RHQ Snapshot"
+    lines.append(title)
     lines.append("")
     if focus == "licensed":
         lines.append(
@@ -2545,49 +3133,64 @@ def _format_saudi_licensing_briefing(summary: dict, focus: str = "both") -> str:
         )
     else:
         lines.append(
-            f"**{total_rhq:,} companies hold an active Saudi Regional "
-            f"Headquarters (RHQ) licence**, drawn from a broader pool of "
-            f"**{total_lic:,} MISA-licensed companies** in the database."
+            f"**{total_lic:,} companies hold an active MISA licence** in "
+            f"the database. Of these, **{total_rhq:,}** hold a Saudi "
+            f"Regional Headquarters (RHQ) licence."
         )
     lines.append("")
     lines.append("---")
     lines.append("")
-    lines.append("### 📊 Top HQ Countries — RHQ Licence Holders")
+    lines.append("### 📊 Top Origin Countries — RHQ Licence Holders")
     lines.append("")
-    lines.append("| Rank | HQ Country | RHQ Companies |")
+    lines.append("| Rank | Origin Country | RHQ Companies |")
     lines.append("|---|---|---|")
     for i, r in enumerate(rhq_named[:10], start=1):
         lines.append(f"| {i} | {r['country']} | **{r['n']}** |")
     if rhq_other:
         lines.append(
-            f"\n_Plus {rhq_other} additional RHQ companies whose HQ "
-            f"country isn't normalised in the database._"
+            f"\n_Plus {rhq_other} additional RHQ companies whose origin "
+            f"nationality isn't tagged in the database._"
         )
     lines.append("")
     lines.append("---")
     lines.append("")
     lines.append("### 🇸🇦 Licensed Pool (Broader)")
     lines.append("")
-    lines.append(
-        f"The full licensed pool is dominated by **Saudi Arabia "
-        f"({lic_saudi:,}** — domestic licences)."
-    )
+    if lic_saudi:
+        lines.append(
+            f"The full licensed pool includes **{lic_saudi:,}** domestic "
+            f"Saudi licences, plus foreign-origin companies below."
+        )
+    else:
+        lines.append(
+            f"Canonical total: **{total_lic:,}** licensed companies "
+            f"(`licensed = true`). Foreign-origin nationality tags "
+            f"(where available) are shown below."
+        )
     lines.append("")
-    lines.append("Top non-Saudi origin countries:")
-    for r in lic_named[:8]:
-        lines.append(f"- **{r['country']}**: {r['n']:,}")
+    if lic_named:
+        lines.append("Top non-Saudi origin countries (tagged nationality):")
+        for r in lic_named[:8]:
+            lines.append(f"- **{r['country']}**: {r['n']:,}")
     if lic_other:
-        lines.append(f"- _Unspecified / other_: {lic_other:,}")
+        lines.append(
+            f"- _No nationality tag in supporting tables_: {lic_other:,}"
+        )
     lines.append("")
     lines.append("---")
     lines.append("")
     lines.append("### 🇸🇦 Strategic Read")
-    if rhq_named:
+    if len(rhq_named) >= 3:
         lines.append(
-            f"- The top three HQ countries (**{rhq_named[0]['country']}**, "
-            f"**{rhq_named[1]['country'] if len(rhq_named) > 1 else '-'}**, "
-            f"**{rhq_named[2]['country'] if len(rhq_named) > 2 else '-'}**) "
+            f"- The top three origin countries (**{rhq_named[0]['country']}**, "
+            f"**{rhq_named[1]['country']}**, "
+            f"**{rhq_named[2]['country']}**) "
             f"account for **{top3_pct}%** of all RHQ licences."
+        )
+    elif rhq_named:
+        lines.append(
+            f"- Leading RHQ origin: **{rhq_named[0]['country']}** "
+            f"({rhq_named[0]['n']} companies)."
         )
     lines.append(
         "- The licensed-but-not-RHQ pool is the upgrade pipeline: "
@@ -2597,14 +3200,14 @@ def _format_saudi_licensing_briefing(summary: dict, focus: str = "both") -> str:
     if rhq_other:
         lines.append(
             f"- **Data hygiene flag:** {rhq_other} RHQ-flagged company "
-            "rows have non-normalised HQ country values — worth a "
+            "rows have no origin nationality tag — worth a "
             "data-quality pass to enable cleaner geographic targeting."
         )
     lines.append("")
     lines.append(
-        "_Sources: `company_profiles.role` (Licensed Entity) and "
-        "`registration_type` (RHQ) — MISA's canonical licensing markers. "
-        "Counts via live `SELECT COUNT(*)`._"
+        "_Sources: `company_profiles.licensed` and `company_profiles.is_rhq` "
+        "— MISA's canonical licensing markers. Counts via live "
+        "`SELECT COUNT(*) WHERE licensed = true` / `is_rhq = true`._"
     )
     return "\n".join(lines)
 
@@ -2725,32 +3328,31 @@ def _try_company_profile_correlated(
         {"_company_correlated": True, "_target": canon or target},
         pack,
     )]
-    # DEPTH-GATED PAYLOAD PRUNING (perf fix). At simple_fact depth
-    # the curator only needs the primary row — fanning out all 12 FK
-    # sections inflates the LLM payload by 10-20× and inflates wall
-    # time from ~3s to ~18s on questions like "Where is Apple HQ".
-    # Skip the section fan-out entirely when depth is simple_fact;
-    # the depth_note already tells the curator to keep the answer
-    # to 1-3 lines, so the extra payload would be wasted tokens.
+    # Always attach briefing-critical FK sections (execs / geo / opps /
+    # financials). Pruning these at simple_fact was the root cause of
+    # "HQ ask is fine but company brief loses Operational Detail" —
+    # SSE kept full folds, JSON path did not. Heavy sections (news,
+    # meetings, …) still skip at simple_fact for latency.
     _depth = pack.get("_depth") or ""
-    if _depth == "simple_fact":
-        return tcs
-    # Map each correlator section to a labelled tool_call (only when
-    # the section has rows — keeps the curation payload focused).
-    section_tables = [
+    _BRIEFING_CRITICAL = (
         ("executives",             "company_executives"),
-        ("competitors",            "company_competitors"),
         ("geographic_revenues",    "company_geographic_revenues"),
         ("financial_performances", "company_financial_performances"),
+        ("opportunities",          "opportunities"),
+    )
+    _HEAVY_SECTIONS = (
+        ("competitors",            "company_competitors"),
         ("global_presences",       "company_global_presences"),
         ("business_units",         "company_business_units"),
         ("news",                   "company_news"),
         ("ai_insights",            "company_ai_insights"),
         ("misa_contacts",          "misa_contact_details"),
-        ("opportunities",          "opportunities"),
         ("strategic_investors",    "strategic_investors"),
         ("meetings",               "meetings"),
-    ]
+    )
+    section_tables = list(_BRIEFING_CRITICAL)
+    if _depth != "simple_fact":
+        section_tables.extend(_HEAVY_SECTIONS)
     for key, table_label in section_tables:
         rows = summary.get(key) or []
         if not rows:
@@ -2913,7 +3515,10 @@ def _try_country_profile_direct(
         return None
     bundle = fetch_country_profile_bundle(target)
     si = bundle.get("saudi_investors") or {}
-    has_si = bool(si.get("rhq") or si.get("licensed_only") or si.get("non_licensed"))
+    has_si = bool(
+        si.get("rhq") or si.get("licensed_only") or si.get("non_licensed")
+        or si.get("_db_error") or si.get("do_not_claim_zero")
+    )
     if not bundle.get("country_profile") and not has_si:
         return None
 
@@ -2958,6 +3563,33 @@ def _try_country_profile_direct(
     total_non_lic_rhq = si.get("total_non_licensed_rhq", 0)
     total_present = total_lic + total_non_lic
     country = bundle["_canonical_name"]
+    if si.get("_db_error") or si.get("do_not_claim_zero"):
+        # Do not invent a "0 companies" summary line on retrieval failure.
+        pack["_degraded"] = "country_profile_footprint_unavailable"
+        pack["_retrieval"] = si.get("retrieval") or {
+            "do_not_claim_zero": True,
+            "counts_unavailable": True,
+        }
+        # Still return macros/outlook if present; footprint sections skipped.
+        if not tcs:
+            return None
+        # Attach an explicit limitation tool_call so curation cannot invent zeros.
+        tcs.append(_build_engagement_tool_call(
+            "company_profiles_footprint_unavailable",
+            [],
+            {
+                "_country_direct": True,
+                "_target": country,
+                "_db_error": si.get("_db_error"),
+                "_retrieval_status": si.get("retrieval_status"),
+                "_summary_line": (
+                    f"Internal MISA footprint data for **{country}** could "
+                    f"not be retrieved — this is **not** a verified zero."
+                ),
+            },
+            pack,
+        ))
+        return tcs
     if total_non_lic:
         _rhq_note = (
             f" (including {total_non_lic_rhq} with RHQ status)"
@@ -3419,42 +4051,41 @@ def _try_executive_lookup_direct(
             "row_entity_sanity_passed": True,
             "closest_names": [],
         })
-    # CORRELATOR AUGMENTATION (Tier 2): pull the parent company's
-    # full bundle in parallel — opportunities, news, ai_insights,
-    # meetings, MISA contacts — so the curator can reference them
-    # alongside the person. Without this, "Who is the CEO of Apple?"
-    # gives just the CEO record + the company snapshot row; with it,
-    # the answer can reference recent Apple meetings, open opportunities,
-    # named MISA contacts.
-    try:
-        from app.services.correlator import (
-            correlate_company, bundle_summary_for_prompt,
-        )
-        bundle = correlate_company(company_ids)
-        summary = bundle_summary_for_prompt(bundle)
-        # Add tool_calls for each non-empty correlator section that we
-        # didn't already include via the executive lookup itself.
-        for key, table_label in [
-            ("opportunities",          "opportunities"),
-            ("misa_contacts",          "misa_contact_details"),
-            ("meetings",               "meetings"),
-            ("ai_insights",            "company_ai_insights"),
-            ("news",                   "company_news"),
-            ("strategic_investors",    "strategic_investors"),
-        ]:
-            rows = summary.get(key) or []
-            if not rows:
-                continue
-            tool_calls.append(_build_engagement_tool_call(
-                table_label, rows,
-                {"_exec_correlator_context": True,
-                 "_target_company": company,
-                 "_correlator_section": key},
-                pack,
-            ))
-    except Exception:
-        # Correlator is augmentation only — never block the answer.
-        pass
+    # CORRELATOR: for named-person bios, a light company bundle helps
+    # Strategic Read. For "who is the CEO of <Company>?" role lookups,
+    # the full meetings/contacts/opportunities dump causes local models
+    # to emit a company briefing instead of a person brief — skip it.
+    _role_only = bool(role) and not person
+    if not _role_only:
+        try:
+            from app.services.correlator import (
+                correlate_company, bundle_summary_for_prompt,
+            )
+            bundle = correlate_company(company_ids)
+            summary = bundle_summary_for_prompt(bundle)
+            # Add tool_calls for each non-empty correlator section that we
+            # didn't already include via the executive lookup itself.
+            for key, table_label in [
+                ("opportunities",          "opportunities"),
+                ("misa_contacts",          "misa_contact_details"),
+                ("meetings",               "meetings"),
+                ("ai_insights",            "company_ai_insights"),
+                ("news",                   "company_news"),
+                ("strategic_investors",    "strategic_investors"),
+            ]:
+                rows = summary.get(key) or []
+                if not rows:
+                    continue
+                tool_calls.append(_build_engagement_tool_call(
+                    table_label, rows,
+                    {"_exec_correlator_context": True,
+                     "_target_company": company,
+                     "_correlator_section": key},
+                    pack,
+                ))
+        except Exception:
+            # Correlator is augmentation only — never block the answer.
+            pass
     return tool_calls
 
 
@@ -3667,27 +4298,23 @@ def _augment_exec_answer_with_web(
             r for r in results if (r.get("url") or "").startswith("http")
         )
 
-    no_web_section = (
-        "## What's Reported (Live Web)\n"
-        "*No reliable web sources found to verify the current officeholder. "
-        "Treat any database 'current' tenure as unverified.*"
-        if mode == "current_office"
-        else
-        "## What's Reported (Live Web)\n"
-        "*No reliable web sources found for this forward-looking question.*"
-    )
-
     if not results:
-        if lead_with_web:
-            return f"{no_web_section}\n\n{db_answer}"
-        return f"{db_answer}\n\n{no_web_section}"
+        # Empty web lane is noise — never required. Return the DB brief alone.
+        return db_answer
 
     try:
         from app.services import web_search
         from app.services.style_guide import STYLE_GUIDE_PROMPT
         evidence = web_search.format_for_prompt(results)
         from app.config import openai_max_completion_tokens_kw
+        compose_client, compose_model = client, model
         if mode == "current_office":
+            # db_answer is Postgres-grounded prose — must not leave the
+            # machine under residency strict (compose on Ollama).
+            from app.services.llm_residency import resolve_data_completion_client
+            compose_client, compose_model = resolve_data_completion_client(
+                client, preferred_model=model,
+            )
             user_content = STYLE_GUIDE_PROMPT + "\n\n" + _EXEC_CURRENT_HOLDER_PROMPT.format(
                 question=user_question,
                 web_evidence=evidence,
@@ -3697,8 +4324,8 @@ def _augment_exec_answer_with_web(
             user_content = STYLE_GUIDE_PROMPT + "\n\n" + _EXEC_NEWS_PROMPT.format(
                 question=user_question, web_evidence=evidence,
             )
-        resp = client.chat.completions.create(
-            model=model,
+        resp = compose_client.chat.completions.create(
+            model=compose_model,
             messages=[{"role": "user", "content": user_content}],
             **_det_kw(),
             **openai_max_completion_tokens_kw(),
@@ -3790,6 +4417,11 @@ def _run_advisory_path(user_question: str, pack: dict, ui_locale: str,
         )
     if not answer:
         return None
+    if db_ctx:
+        pack["_advisory_db_context"] = db_ctx
+        pack["_retrieval"] = db_ctx.get("retrieval") or {
+            "retrieval_status": db_ctx.get("retrieval_status"),
+        }
     # Deterministic post-generation guard: strip fabricated footprint
     # sections (no DB context) and rebuild footprint counts that don't
     # match the database. Code-enforced — prompt instructions drift.
@@ -3797,20 +4429,147 @@ def _run_advisory_path(user_question: str, pack: dict, ui_locale: str,
         from app.services.response_validator import (
             validate_advisory_answer,
         )
-        answer, _adv_fixes = validate_advisory_answer(answer, db_ctx)
+        answer, _adv_fixes = validate_advisory_answer(
+            answer, db_ctx, deliverable=deliverable,
+        )
         if _adv_fixes:
             pack["_advisory_validation_fixes"] = _adv_fixes
+        try:
+            from app.services.advisory_enrichment import (
+                enrich_advisory_deliverable,
+            )
+            answer, _enr_fixes = enrich_advisory_deliverable(
+                answer, deliverable=deliverable, db_context=db_ctx,
+            )
+            if _enr_fixes:
+                pack["_advisory_enrichment_fixes"] = _enr_fixes
+            # Repair pass: if required Jul21 sections still missing after
+            # the first enrich, re-run scaffolds once (idempotent).
+            try:
+                from app.services.answer_contracts import (
+                    advisory_deliverable_violations,
+                )
+                _miss = advisory_deliverable_violations(
+                    answer, deliverable=deliverable,
+                )
+                if _miss:
+                    pack["_advisory_section_gaps"] = _miss
+                    answer, _repair = enrich_advisory_deliverable(
+                        answer, deliverable=deliverable, db_context=db_ctx,
+                    )
+                    if _repair:
+                        pack.setdefault(
+                            "_advisory_enrichment_fixes", [],
+                        ).extend(
+                            [f"repair:{x}" for x in _repair]
+                        )
+                    _miss2 = advisory_deliverable_violations(
+                        answer, deliverable=deliverable,
+                    )
+                    if _miss2:
+                        pack["_advisory_section_gaps_after_repair"] = _miss2
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            from app.services.quality_gate import run_quality_gate
+            answer, _qg_issues, _qg_fixes = run_quality_gate(
+                answer,
+                question=user_question,
+                db_context=db_ctx,
+                retrieval_meta=(db_ctx or {}).get("retrieval"),
+                deliverable=deliverable,
+            )
+            if _qg_fixes:
+                pack["_quality_gate_fixes"] = _qg_fixes
+            if _qg_issues:
+                pack["_quality_gate_issues"] = [
+                    i.get("code") for i in _qg_issues
+                ]
+                try:
+                    from app.logger import logger as _log
+                    _log.warning(
+                        "quality_gate issues=%s fixes=%s",
+                        pack["_quality_gate_issues"], _qg_fixes,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        from app.services.answer_finalize import finalize_answer
+        pack["_answer_source"] = "strategic_advisory"
+        pack["_advisory_deliverable"] = deliverable
+        pack["_short_circuit"] = "strategic_advisory"
+        answer = finalize_answer(
+            answer, user_question=user_question, pack=pack,
+        )
+    except Exception:
+        pass
+    # Fail-closed: after finalize, if the Jul21 advisory shape is still
+    # missing (LLM sometimes emits a named-company Engagement Recommendation
+    # stub), force enrichment scaffolds again.
+    try:
+        from app.services.answer_contracts import advisory_deliverable_violations
+        from app.services.advisory_enrichment import enrich_advisory_deliverable
+        _gaps = advisory_deliverable_violations(
+            answer, deliverable=deliverable,
+        )
+        if _gaps:
+            pack["_advisory_post_finalize_gaps"] = _gaps
+            answer, _pf = enrich_advisory_deliverable(
+                answer, deliverable=deliverable, db_context=db_ctx,
+            )
+            if _pf:
+                pack.setdefault("_advisory_enrichment_fixes", []).extend(
+                    [f"post_finalize:{x}" for x in _pf]
+                )
     except Exception:
         pass
     pack["_short_circuit"] = "strategic_advisory"
     pack["_advisory_deliverable"] = deliverable
     if db_ctx:
         pack["_advisory_origin_country"] = db_ctx.get("origin_country")
+        pack["_advisory_retrieval_status"] = db_ctx.get("retrieval_status")
+        pack["_advisory_licensed"] = db_ctx.get(
+            "companies_from_origin_licensed_in_saudi")
+        pack["_advisory_rhq"] = db_ctx.get("companies_from_origin_with_rhq")
+        pack["_advisory_expansion_n"] = len(
+            db_ctx.get("expansion_targets") or [])
+        if db_ctx.get("footprint_data_unavailable"):
+            pack["_advisory_footprint_unavailable"] = True
+            pack["_advisory_db_error"] = db_ctx.get("_db_error")
+        try:
+            from app.logger import logger as _log
+            _log.info(
+                "advisory_path deliverable=%s country=%s status=%s "
+                "licensed=%s rhq=%s expansion=%s filters=%s",
+                deliverable,
+                db_ctx.get("origin_country"),
+                db_ctx.get("retrieval_status")
+                or ("error" if db_ctx.get("footprint_data_unavailable")
+                    else "none"),
+                db_ctx.get("companies_from_origin_licensed_in_saudi"),
+                db_ctx.get("companies_from_origin_with_rhq"),
+                len(db_ctx.get("expansion_targets") or []),
+                db_ctx.get("retrieval_filters"),
+            )
+        except Exception:
+            pass
+    # Lift deliverable + DB context onto the result so JSON polish,
+    # SSE, PDF/DOCX, and finalize all see the same contract — not only
+    # the in-path validator.
     return {
         "answer": answer,
         "tool_calls": [{"input_trace": dict(pack)}],
         "error": None,
         "_answer_source": "strategic_advisory",
+        "_advisory_deliverable": deliverable,
+        "_advisory_db_context": db_ctx,
+        "_short_circuit": "strategic_advisory",
         "feedback_context": hf.build_feedback_context(
             user_question, ui_locale, resp_loc, pack,
         ),
@@ -3913,6 +4672,21 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
     resp_loc = _effective_response_locale(ui_locale, user_question)
     client = get_openai_client()
 
+    # Structured intent + pipeline trace (Phase 1/7) — before any retrieval.
+    try:
+        from app.services.query_intent import build_query_intent
+        from app.services.pipeline_trace import new_trace
+        _qi = build_query_intent(
+            user_question,
+            history,
+            entity_candidate=pack.get("entity_candidate"),
+        )
+        pack["_query_intent"] = _qi.to_dict()
+        pack["_pipeline_trace"] = new_trace()
+        pack["_pipeline_trace"].intent = _qi.to_log_dict()
+    except Exception:
+        pack["_query_intent"] = {"task_type": "unknown"}
+
     if client is None:
         return {
             "answer": "",
@@ -3987,8 +4761,20 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
                         else "document_library"
                     )
                     pack["_document_hit_count"] = len(_hits)
+                    _doc_answer = _composed["answer"]
+                    try:
+                        from app.services.answer_finalize import finalize_answer
+                        pack["_answer_source"] = _src
+                        pack["_keep_citations"] = True
+                        _doc_answer = finalize_answer(
+                            _doc_answer,
+                            user_question=user_question,
+                            pack=pack,
+                        )
+                    except Exception:
+                        pass
                     return {
-                        "answer": _composed["answer"],
+                        "answer": _doc_answer,
                         "tool_calls": [{
                             "input_trace": dict(pack),
                             "table": "_documents",
@@ -4013,27 +4799,33 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
             # Document path must never take the whole chat down.
             pass
 
-    # DEEP-PROFILE MODE (explicit opt-in).
-    # Triggered by '/profile X', 'deep profile of X', 'executive
-    # briefing on X', 'strategic profile: X'. Heavier path: pulls DB
-    # rows, calls web search (gracefully empty without TAVILY_API_KEY),
-    # produces a 3-pillar executive dashboard with strict [DB]/[web:N]/
-    # [inferred] provenance tags on every bullet. Lives in
-    # app/services/deep_profile.py so the normal curation prompt stays
-    # uncontaminated. Only runs when the user explicitly asks for it.
+    # DEEP-PROFILE MODE (explicit opt-in ONLY).
+    # Triggered by '/profile X' or 'deep profile of X'. Natural
+    # "briefing on X" / "company profile for X" use the Jul21 company
+    # path — not this heavier 3-pillar mode.
     from app.services import deep_profile as _dp
     deep_target = _dp.is_deep_profile_request(user_question)
     # GUARD: deep-profile is for a SPECIFIC NAMED ENTITY (a company,
-    # person, country). Triggers like 'investment case for X' also fire
-    # on MARKET SEGMENTS ('German manufacturers in Saudi Arabia'), which
-    # are advisory strategy questions — deep-profiling a segment returns
-    # an empty 'no evidence' shell. If the question is advisory-shaped or
-    # the target names a market class, skip deep-profile so the advisory
-    # path handles it.
+    # person, country). Skip market segments and corridor advisories.
     if deep_target and (
         _looks_like_market_segment(deep_target)
         or (_is_advisory_question(user_question)
             and _detect_origin_country(user_question))
+    ):
+        deep_target = None
+    # GUARD: CEO / person asks and sector briefings must never be stolen
+    # by deep-profile even if a future trigger regresses.
+    if deep_target:
+        try:
+            from app.services.db_briefing import _question_looks_like_person
+            if _question_looks_like_person(user_question):
+                deep_target = None
+        except Exception:
+            pass
+    if deep_target and re.search(
+        r"(?i)\bsector\s+(?:briefing|overview|opportunit)|"
+        r"\bopportunit(?:y|ies)\s+in\b",
+        user_question or "",
     ):
         deep_target = None
     if deep_target:
@@ -4060,6 +4852,15 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
         pack["_deep_profile_target"] = deep_target
         pack["_deep_profile_entity_type"] = result.get("entity_type")
         pack["_deep_profile_parent"] = result.get("parent_entity")
+        try:
+            from app.services.answer_finalize import finalize_answer
+            pack["_answer_source"] = "deep_profile"
+            pack["_keep_citations"] = True
+            body = finalize_answer(
+                body, user_question=user_question, pack=pack,
+            )
+        except Exception:
+            pass
         return {
             "answer": body,
             "tool_calls": result["tool_calls"],
@@ -4088,6 +4889,36 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
             return _adv_result
         # Advisory generation failed (OpenAI error) — fall through to
         # the normal pipeline rather than returning nothing.
+
+    # SECTOR AGGREGATION — early short-circuit (before intent classifier).
+    # "momentum across all sectors" is often mislabelled as general
+    # research / off-topic and falls to thin GK. Aggregation detection
+    # is deterministic; do not wait on the classifier.
+    if _is_sector_aggregation_question(user_question):
+        try:
+            tcs = _try_sector_aggregation_direct(
+                user_question, pack, client, OPENAI_MODEL,
+            )
+        except Exception:
+            tcs = None
+        if tcs is not None:
+            rows = pack.get("_sector_aggregation_rows") or []
+            if rows:
+                answer = _format_sector_opportunity_briefing(rows)
+                try:
+                    from app.services.answer_finalize import finalize_answer
+                    answer = finalize_answer(
+                        answer, user_question=user_question, pack=pack,
+                    )
+                except Exception:
+                    pass
+                return {
+                    "answer": answer, "tool_calls": tcs, "error": None,
+                    "_answer_source": "sector_aggregation",
+                    "feedback_context": hf.build_feedback_context(
+                        user_question, ui_locale, resp_loc, pack,
+                    ),
+                }
 
     # INTENT CLASSIFICATION (LLM-driven, intent-first) + speculative
     # EXECUTIVE-TARGET EXTRACTION in parallel.
@@ -4128,6 +4959,22 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
     pack["_intent"] = intent_meta.get("intent")
     pack["_intent_confidence"] = intent_meta.get("confidence")
     pack["_intent_reasoning"] = intent_meta.get("reasoning")
+
+    # Engagement-plan phrasing must not stay as broad_topic / entity_lookup
+    # — that made curation emit Executive Briefing instead of the
+    # Engagement Recommendation → Snapshot → MENA → Strategic Read shape.
+    try:
+        from app.services.db_briefing import _question_looks_like_engagement_plan
+        if _question_looks_like_engagement_plan(user_question):
+            if pack.get("_intent") != "engagement_strategy":
+                pack["_intent_overridden_from"] = pack.get("_intent")
+                pack["_intent"] = "engagement_strategy"
+                pack["_intent_reasoning"] = (
+                    (pack.get("_intent_reasoning") or "")
+                    + " | forced engagement_strategy from question shape"
+                ).strip(" |")
+    except Exception:
+        pass
 
     # DEPTH DETECTION (Tier 3 commit 1) — intent says WHAT the user
     # wants; depth says HOW MUCH. Same intent + different depth →
@@ -4287,6 +5134,28 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
                     fetch_country_saudi_investors,
                 )
                 stats = fetch_country_saudi_investors(_list_country)
+                if stats.get("_db_error"):
+                    answer = _format_country_licensing_answer(
+                        _list_country, stats)
+                    pack["_country_company_list"] = _list_country
+                    pack["_degraded"] = "country_list_retrieval_failed"
+                    tcs = [{
+                        "table": "company_profiles",
+                        "filters": {"_db_error": stats.get("_db_error"),
+                                    "_retrieval_status": stats.get(
+                                        "retrieval_status")},
+                        "sql": None, "params": [], "rows_df": None,
+                        "row_count": 0,
+                        "input_trace": dict(pack),
+                        "error": stats.get("_db_error"),
+                    }]
+                    return {
+                        "answer": answer, "tool_calls": tcs, "error": None,
+                        "_answer_source": "db",
+                        "feedback_context": hf.build_feedback_context(
+                            user_question, ui_locale, resp_loc, pack,
+                        ),
+                    }
                 answer = _format_country_licensing_answer(_list_country, stats)
                 pack["_country_company_list"] = _list_country
                 tcs = [{
@@ -4294,9 +5163,9 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
                     "filters": {"_country_company_list": _list_country,
                                 "_total_licensed": stats.get("total_licensed"),
                                 "_total_rhq": stats.get("total_rhq")},
-                    "sql": "SELECT ... FROM company_profiles WHERE "
-                           "role='Licensed Entity' AND shareholder nationality "
-                           "ILIKE %s (non-licensed via country_profile_name)",
+                    "sql": "SELECT COUNT(*) FROM company_profiles WHERE "
+                           "licensed = true [AND is_rhq = true] "
+                           "AND origin nationality match",
                     "params": [_list_country], "rows_df": None,
                     "row_count": int(stats.get("total_licensed") or 0),
                     "input_trace": dict(pack),
@@ -4335,53 +5204,146 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
                 answer = _format_country_licensing_answer(_lic_country, stats)
                 pack["_saudi_licensing_count"] = True
                 pack["_licensing_country"] = _lic_country
+                if stats.get("_db_error"):
+                    pack["_degraded"] = "country_licensing_retrieval_failed"
                 tcs = [{
                     "table": "company_profiles",
-                    "filters": {"_licensing_country": _lic_country,
-                                "_total_licensed": stats.get("total_licensed"),
-                                "_total_rhq": stats.get("total_rhq")},
-                    "sql": "SELECT COUNT(*) FROM company_profiles WHERE "
-                           "role='Licensed Entity' [AND registration_type='RHQ'] "
-                           "AND shareholder nationality ILIKE %s",
+                    "filters": {
+                        "_licensing_country": _lic_country,
+                        "_total_licensed": stats.get("total_licensed"),
+                        "_total_rhq": stats.get("total_rhq"),
+                        "_db_error": stats.get("_db_error"),
+                        "_retrieval_status": stats.get("retrieval_status"),
+                    },
+                    "sql": (
+                        None if stats.get("_db_error") else
+                        "SELECT COUNT(*) FROM company_profiles WHERE "
+                        "licensed = true [AND is_rhq = true] "
+                        "AND shareholder/nationality origin match"
+                    ),
                     "params": [_lic_country], "rows_df": None,
-                    "row_count": int(stats.get("total_licensed") or 0),
+                    "row_count": (
+                        None if stats.get("_db_error")
+                        else int(stats.get("total_licensed") or 0)
+                    ),
                     "input_trace": dict(pack),
-                    "sql_entity_check_passed": True,
-                    "row_entity_sanity_passed": True,
+                    "sql_entity_check_passed": not bool(
+                        stats.get("_db_error")),
+                    "row_entity_sanity_passed": not bool(
+                        stats.get("_db_error")),
+                    "error": stats.get("_db_error"),
                 }]
+                try:
+                    from app.services.quality_gate import run_quality_gate
+                    _db_ctx = {
+                        "origin_country": _lic_country,
+                        "companies_from_origin_licensed_in_saudi":
+                            stats.get("total_licensed"),
+                        "companies_from_origin_with_rhq":
+                            stats.get("total_rhq"),
+                        "footprint_data_unavailable": bool(
+                            stats.get("_db_error")
+                            or stats.get("counts_unavailable")
+                        ),
+                        "retrieval_status": stats.get("retrieval_status"),
+                        "retrieval": stats.get("retrieval"),
+                    }
+                    answer, _iss, _fixes = run_quality_gate(
+                        answer,
+                        question=user_question,
+                        db_context=_db_ctx,
+                        retrieval_meta=stats.get("retrieval"),
+                        hard_block=True,
+                    )
+                    if _fixes:
+                        pack["_quality_gate_fixes"] = _fixes
+                except Exception:
+                    pass
                 return {
                     "answer": answer, "tool_calls": tcs, "error": None,
+                    "_answer_source": "db",
+                    "_retrieval": stats.get("retrieval"),
+                    "feedback_context": hf.build_feedback_context(
+                        user_question, ui_locale, resp_loc, pack,
+                    ),
+                }
+            except Exception as exc:
+                # Country-scoped licensing ask must NEVER fall through to
+                # the global aggregate (that was a wrong-answer class).
+                pack["_saudi_licensing_count"] = True
+                pack["_licensing_country"] = _lic_country
+                pack["_degraded"] = "country_licensing_exception"
+                from app.services.retrieval_status import (
+                    classify_exception, failure, user_facing_retrieval_message,
+                )
+                rr = failure(
+                    classify_exception(exc),
+                    source_name="company_profiles.licensed/is_rhq",
+                    error=str(exc),
+                    filters={"origin_country": _lic_country},
+                )
+                pack["_retrieval"] = rr.to_context_dict()
+                answer = (
+                    f"## {_lic_country}-origin companies in Saudi Arabia\n\n"
+                    + user_facing_retrieval_message(rr)
+                )
+                return {
+                    "answer": answer,
+                    "tool_calls": [{
+                        "table": "company_profiles",
+                        "filters": {
+                            "_licensing_country": _lic_country,
+                            "_db_error": str(exc),
+                            "_retrieval_status": rr.status.value,
+                        },
+                        "sql": None, "params": [], "rows_df": None,
+                        "row_count": None,
+                        "input_trace": dict(pack),
+                        "error": str(exc),
+                    }],
+                    "error": None,
                     "_answer_source": "db",
                     "feedback_context": hf.build_feedback_context(
                         user_question, ui_locale, resp_loc, pack,
                     ),
                 }
-            except Exception:
-                pass  # fall through to the generic aggregate on failure
         try:
             from app.services.engagement_data import fetch_saudi_licensing_summary
             summary = fetch_saudi_licensing_summary()
             answer = _format_saudi_licensing_briefing(
                 summary, focus=_licensing_question_focus(user_question))
             pack["_saudi_licensing_count"] = True
+            pack["_retrieval"] = summary.get("retrieval")
+            try:
+                from app.services.quality_gate import run_quality_gate
+                answer, _, _fixes = run_quality_gate(
+                    answer, question=user_question,
+                    retrieval_meta=summary.get("retrieval"),
+                )
+                if _fixes:
+                    pack["_quality_gate_fixes"] = _fixes
+            except Exception:
+                pass
             # Single synthetic tool_call so debug=true / trace shows
             # the source attribution.
             tcs = [{
                 "table": "company_profiles",
                 "filters": {"_saudi_licensing_count": True,
                             "_total_rhq": summary.get("total_rhq"),
-                            "_total_licensed": summary.get("total_licensed")},
+                            "_total_licensed": summary.get("total_licensed"),
+                            "_retrieval_status": summary.get(
+                                "retrieval_status")},
                 "sql": "SELECT COUNT(*) FROM company_profiles "
-                       "WHERE role='Licensed Entity' [AND registration_type='RHQ']",
+                       "WHERE licensed = true [AND is_rhq = true]",
                 "params": [], "rows_df": None,
-                "row_count": (summary.get("total_rhq") or 0)
-                             + (summary.get("total_licensed") or 0),
+                "row_count": summary.get("total_licensed") or 0,
                 "input_trace": dict(pack),
                 "sql_entity_check_passed": True,
                 "row_entity_sanity_passed": True,
             }]
             return {
                 "answer": answer, "tool_calls": tcs, "error": None,
+                "_answer_source": "db",
                 "feedback_context": hf.build_feedback_context(
                     user_question, ui_locale, resp_loc, pack,
                 ),
@@ -4409,6 +5371,9 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
             )
             return {
                 "answer": answer, "tool_calls": tcs, "error": None,
+                "_answer_source": pack.get("_answer_source"),
+                "_web_sources": pack.get("_web_sources"),
+                "_doc_sources": pack.get("_doc_sources"),
                 "feedback_context": hf.build_feedback_context(
                     user_question, ui_locale, resp_loc, pack,
                 ),
@@ -4475,15 +5440,11 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
                     f"## Engagement History — {target}\n\n"
                     f"**No engagement history found** for {target} in "
                     f"MISA's internal records (meetings, engagements, "
-                    f"misa_contact_details, or recent interactions).\n\n"
-                    f"_Internal records do not currently show: meetings, "
-                    f"engagement notes, action points, MISA contact "
-                    f"assignments, or recent interactions for this entity._\n\n"
-                    f"This means either the entity has no recorded MISA "
-                    f"engagements, or its records are filed under a "
-                    f"different legal name in the database. Try the full "
-                    f"company name or check `company_profiles` for the "
-                    f"canonical name."
+                    f"contact assignments, or recent interactions).\n\n"
+                    f"This usually means either the entity has no recorded "
+                    f"MISA engagements yet, or its records are filed under "
+                    f"a different legal name. Try the full registered company "
+                    f"name and re-ask."
                 )
                 return {
                     "answer": answer, "tool_calls": tcs, "error": None,
@@ -4599,11 +5560,24 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
         except Exception:
             tcs = None
         if tcs is not None:
-            answer = _compose_local_commentary(
-                tcs, user_question, pack, response_locale=resp_loc,
-            )
+            # Prefer deterministic Jul21-lite briefing over curator compression.
+            rows = pack.get("_sector_aggregation_rows") or []
+            if rows:
+                answer = _format_sector_opportunity_briefing(rows)
+                try:
+                    from app.services.answer_finalize import finalize_answer
+                    answer = finalize_answer(
+                        answer, user_question=user_question, pack=pack,
+                    )
+                except Exception:
+                    pass
+            else:
+                answer = _compose_local_commentary(
+                    tcs, user_question, pack, response_locale=resp_loc,
+                )
             return {
                 "answer": answer, "tool_calls": tcs, "error": None,
+                "_answer_source": "sector_aggregation",
                 "feedback_context": hf.build_feedback_context(
                     user_question, ui_locale, resp_loc, pack,
                 ),
@@ -4624,6 +5598,8 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
         try:
             # Consume the speculative extraction kicked off in parallel
             # with the classifier — avoids a sequential second LLM call.
+            pack["_intent"] = intent_meta.get("intent")
+            pack.setdefault("_query_intent", intent_meta)
             exec_tcs = _try_executive_lookup_direct(
                 user_question, pack, client, OPENAI_MODEL,
                 prefetched_target=_speculative_exec_target,
@@ -4673,9 +5649,19 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
                     capture_sources=exec_web_sources,
                     mode="current_office" if is_officeholder else "succession",
                 )
+            try:
+                from app.services.answer_finalize import finalize_answer
+                pack["_intent"] = intent_meta.get("intent") or pack.get("_intent")
+                pack.setdefault("_query_intent", intent_meta)
+                answer = finalize_answer(
+                    answer, user_question=user_question, pack=pack,
+                )
+            except Exception:
+                pass
             return {
                 "answer": answer, "tool_calls": exec_tcs, "error": None,
                 "web_sources": exec_web_sources,
+                "_answer_source": pack.get("_answer_source") or "curated",
                 "feedback_context": hf.build_feedback_context(
                     user_question, ui_locale, resp_loc, pack,
                 ),
@@ -4692,6 +5678,15 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
                 mode="current_office",
             )
             if answer.strip():
+                try:
+                    from app.services.answer_finalize import finalize_answer
+                    pack["_intent"] = "executive_lookup"
+                    pack["_answer_source"] = "web_officeholder"
+                    answer = finalize_answer(
+                        answer, user_question=user_question, pack=pack,
+                    )
+                except Exception:
+                    pass
                 return {
                     "answer": answer,
                     "tool_calls": [],
@@ -4769,6 +5764,7 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
             )
             return {
                 "answer": answer, "tool_calls": tc_person, "error": None,
+                "_answer_source": pack.get("_answer_source") or "curated",
                 "feedback_context": hf.build_feedback_context(
                     user_question, ui_locale, resp_loc, pack
                 ),
@@ -4827,10 +5823,27 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
     # presents confidently. Route straight to the OpenAI fallback, which
     # by prompt is required to label its answer "NOT from the MISA database".
     if looks_like_general_knowledge_question(user_question) and client is not None:
+        try:
+            from app.services.jul21_surface import looks_like_corridor_investment_ask
+            if looks_like_corridor_investment_ask(user_question):
+                _adv = _run_advisory_path(
+                    user_question, pack, ui_locale, resp_loc, client)
+                if _adv:
+                    return _adv
+        except Exception:
+            pass
         ans = general_knowledge_answer(
             user_question, locale=resp_loc, client=client, model=OPENAI_MODEL,
         )
         if ans:
+            try:
+                from app.services.answer_finalize import finalize_answer
+                pack["_answer_source"] = "off_topic_fallback"
+                ans = finalize_answer(
+                    ans, user_question=user_question, pack=pack,
+                )
+            except Exception:
+                pass
             return {
                 "answer": ans, "tool_calls": [], "error": None,
                 "feedback_context": hf.build_feedback_context(
@@ -4861,15 +5874,38 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
             except Exception:
                 ambiguous = None
             if ambiguous:
-                return {
-                    "answer": format_clarification(ent_for_ambig, ambiguous),
-                    "tool_calls": [],
-                    "error": None,
-                    "_answer_source": "clarification",
-                    "feedback_context": hf.build_feedback_context(
-                        user_question, ui_locale, resp_loc, pack,
-                    ),
-                }
+                # Company-profile asks ("company profile for Hitachi")
+                # should not dead-end on a clarification stub — auto-pick
+                # the top-scoring candidate and continue into Jul21 brief.
+                top = ambiguous[0] if ambiguous else None
+                top_name = (top or {}).get("name") or ""
+                if (
+                    top_name
+                    and re.search(
+                        r"(?i)\b(company\s+(?:profile|briefing)|"
+                        r"briefing\s+on|profile\s+of|"
+                        r"tell\s+me\s+about|brief\s+me\s+on)\b",
+                        user_question or "",
+                    )
+                ):
+                    pack["entity_candidate"] = top_name
+                    pack["_auto_picked_ambiguous"] = top_name
+                    pack["_ambiguous_alternates"] = [
+                        c.get("name") for c in ambiguous[1:4]
+                        if c.get("name")
+                    ]
+                else:
+                    return {
+                        "answer": format_clarification(
+                            ent_for_ambig, ambiguous,
+                        ),
+                        "tool_calls": [],
+                        "error": None,
+                        "_answer_source": "clarification",
+                        "feedback_context": hf.build_feedback_context(
+                            user_question, ui_locale, resp_loc, pack,
+                        ),
+                    }
 
     # Pure-browse short-circuit: "show me companies" / "list deals" etc.
     # These are routinely mishandled by the LLM router (it sends an empty
@@ -4989,6 +6025,26 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
 
                 try:
                     filters = _coerce_filters_mapping(args.get("filters"))
+                    # CODE ENFORCER: never count/aggregate via the auxiliary
+                    # rhq_licenses table — rewrite to company_profiles.
+                    try:
+                        from app.services.source_policy import (
+                            rewrite_aggregate_licensing_query,
+                        )
+                        table, filters, _lic_notes = (
+                            rewrite_aggregate_licensing_query(
+                                table,
+                                count_only=bool(args.get("count_only")),
+                                filters=filters,
+                                question=user_question,
+                            )
+                        )
+                        if _lic_notes:
+                            pack.setdefault("_source_rewrites", []).extend(
+                                _lic_notes
+                            )
+                    except Exception:
+                        pass
                     # Strip noise filters like `company_name = 'MISA'` — the
                     # ministry is the audience, not a company in the data.
                     filters = _strip_self_reference_filters(filters)
@@ -5382,6 +6438,9 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
         ),
         "tool_calls": tool_calls_executed,
         "error": None,
+        "_answer_source": pack.get("_answer_source"),
+        "_web_sources": pack.get("_web_sources"),
+        "_doc_sources": pack.get("_doc_sources"),
         "feedback_context": hf.build_feedback_context(user_question, ui_locale, resp_loc, pack),
     }
 
@@ -5473,26 +6532,23 @@ def build_debug_payload(user_question: str, result: dict) -> dict:
     return debug
 
 
-# ─── Response cache (OPT-IN) ──────────────────────────────────────────
+# ─── Response cache ───────────────────────────────────────────────────
 # Even at temperature 0 + fixed seed, OpenAI is only best-effort
 # deterministic, so the SAME question can still reword slightly between
 # runs. This cache returns the byte-identical answer for a repeated
 # single-turn question within the TTL.
 #
-# DEFAULT OFF. The determinism controls (temperature 0 + seed) already
-# give strong consistency without side effects. The cache adds two
-# risks not worth carrying by default: (1) it freezes whatever the
-# first answer was — a one-off weak answer would be served for the
-# whole TTL; (2) it makes the quality/regression batteries flaky by
-# serving stale answers. Enable with MISA_RESPONSE_CACHE=true when
-# byte-identical repeats matter and the staleness tradeoff is accepted.
+# DEFAULT ON for demo consistency: same single-turn question returns the
+# byte-identical prior answer within TTL. Disable with MISA_RESPONSE_CACHE=false
+# when you need every run to re-hit Azure (e.g. quality A/B). Structure is
+# still contract-locked even with the cache off.
 _RESPONSE_CACHE: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
 _RESPONSE_CACHE_LOCK = Lock()
 
 
 def _response_cache_settings() -> tuple[bool, int, int]:
     import os
-    enabled = (os.getenv("MISA_RESPONSE_CACHE", "false") or "").strip().lower() \
+    enabled = (os.getenv("MISA_RESPONSE_CACHE", "true") or "").strip().lower() \
         in ("1", "true", "yes", "on")
     try:
         ttl = int(os.getenv("MISA_RESPONSE_CACHE_TTL", "900") or "900")
@@ -5547,13 +6603,82 @@ def _is_cacheable(user_question: str, history: list, result: dict) -> bool:
     if len(ans) < 40:
         return False
     src = result.get("_answer_source") or ""
-    if src in ("off_topic_redirect", "prompt_guard_refusal"):
+    if src in (
+        "clarification", "off_topic_fallback",
+        "off_topic_redirect", "prompt_guard_refusal",
+    ):
         return False
     if result.get("_short_circuit") in ("off_topic", "prompt_injection"):
         # Never cache a refusal — every attack attempt should hit the
         # guard fresh so it's logged/telemetered, not served from cache.
         return False
+    # Never freeze raw multi-match listings or retrieval-trace dumps —
+    # those are not Jul21 briefs and poison the cache.
+    if re.search(
+        r"(?i)Multiple possible matches|Your search matched|"
+        r"Open \*\*Retrieval trace\*\*|Retrieval trace",
+        ans,
+    ):
+        return False
+    # Company-profile asks must cache only full Jul21 shapes.
+    if re.search(
+        r"(?i)\b(company\s+(?:profile|briefing)|briefing\s+on|"
+        r"profile\s+of)\b",
+        user_question or "",
+    ):
+        if "Executive Briefing" not in ans and "Snapshot of Operations" not in ans:
+            return False
+    # Corridor engagement / market-fit asks must cache full Jul21 advisory
+    # shape — never freeze a mis-routed named-company Engagement Recommendation.
+    if re.search(
+        r"(?i)\b(engagement\s+plan|market\s+fit|attract\w*\s+\w+\s+compan)",
+        user_question or "",
+    ):
+        if not re.search(r"(?i)Strategic Context", ans):
+            return False
+        if re.search(r"(?i)engagement\s+plan", user_question or ""):
+            if not (
+                re.search(r"(?i)Phase\s*1|Phased\s+Roadmap", ans)
+                and re.search(r"(?i)KPI", ans)
+            ):
+                return False
+        # Named-company engagement stub is never a corridor plan.
+        if re.search(
+            r"(?im)^##\s+Engagement Recommendation\b",
+            ans,
+        ) and not re.search(r"(?i)Phase\s*1|Phased\s+Roadmap", ans):
+            return False
     return True
+
+
+def _attach_quality_meta(result: dict | None) -> dict:
+    """Lift pack quality/intent fields onto the top-level result for the API."""
+    if not result:
+        return result or {}
+    pack: dict = {}
+    for tc in (result.get("tool_calls") or []):
+        trace = tc.get("input_trace")
+        if isinstance(trace, dict) and trace:
+            pack = trace
+            break
+    for k in (
+        "_query_intent", "_quality_gate", "_quality_eval", "_retrieval",
+        "_retrieval_status", "_pipeline_trace", "_data_limitations",
+        "_truncated", "_degraded",
+        "_advisory_deliverable", "_advisory_db_context",
+        "_advisory_validation_fixes", "_quality_gate_fixes",
+        "_quality_gate_issues", "_short_circuit",
+    ):
+        if result.get(k) is None and pack.get(k) is not None:
+            result[k] = pack[k]
+    # Normalize client-facing snapshots
+    if result.get("_pipeline_trace") is not None and hasattr(
+        result["_pipeline_trace"], "trace_id"
+    ):
+        result["_trace_id"] = result["_pipeline_trace"].trace_id
+    elif not result.get("_trace_id"):
+        result["_trace_id"] = None
+    return result
 
 
 def chat(user_question: str, history: list, ui_locale: str = "en") -> dict:
@@ -5570,6 +6695,7 @@ def chat(user_question: str, history: list, ui_locale: str = "en") -> dict:
             return cached
     try:
         result = _chat_execute(user_question, history, ui_locale)
+        result = _attach_quality_meta(result)
         if result.get("error"):
             outcome = "result_error"
         if _cache_key and _is_cacheable(user_question, history, result):
@@ -5604,11 +6730,24 @@ def chat(user_question: str, history: list, ui_locale: str = "en") -> dict:
             # grep the log for low-confidence turns or for a particular
             # failure mode.
             try:
-                payload["detected_intent"] = detect_intent(
-                    user_question, history
-                )
+                from app.services.query_intent import build_query_intent
+                qi = build_query_intent(user_question, history)
+                payload["query_intent"] = qi.to_log_dict()
+                payload["detected_intent"] = qi.legacy_intent_label
             except Exception:
-                payload["detected_intent"] = "unknown"
+                try:
+                    payload["detected_intent"] = detect_intent(
+                        user_question, history
+                    )
+                except Exception:
+                    payload["detected_intent"] = "unknown"
+            if result.get("_quality_eval"):
+                payload["quality_eval"] = {
+                    k: result["_quality_eval"].get(k)
+                    for k in ("score", "pass")
+                }
+            if result.get("_quality_gate"):
+                payload["quality_gate"] = result.get("_quality_gate")
             try:
                 pack_for_log = clean_user_question(user_question)
                 payload["extracted_entity"] = pack_for_log.get(
@@ -5622,6 +6761,12 @@ def chat(user_question: str, history: list, ui_locale: str = "en") -> dict:
             payload["tables_queried"] = [tc.get("table") for tc in tcs if tc.get("table")]
             payload["row_count_total"] = sum(
                 int(tc.get("row_count") or 0) for tc in tcs
+            )
+            # Distinguish verified-empty from failed-retrieval zeros
+            payload["retrieval_failures_n"] = sum(
+                1 for tc in tcs
+                if (tc.get("filters") or {}).get("_db_error")
+                or (tc.get("error"))
             )
             payload["filter_cols_used"] = sorted({
                 k

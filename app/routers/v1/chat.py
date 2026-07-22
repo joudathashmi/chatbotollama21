@@ -234,13 +234,48 @@ async def export_pdf(req: PdfExportRequest):
     """Render the answer markdown + sources as a 1-2 page PDF with
     MISA letterhead, the question as the title, and a numbered
     sources footer. Returns the raw bytes with PDF content type.
+
+    Runs the shared quality gate on client-supplied markdown so
+    truncated rankings / false-zeros are repaired or replaced before
+    document generation.
     """
     from fastapi import HTTPException
     from fastapi.responses import Response
     from app.services.pdf_export import render_pdf
+    answer = req.answer or ""
+    quality_blocked = False
+    try:
+        from app.services.answer_finalize import finalize_answer
+        answer = finalize_answer(
+            answer,
+            user_question=req.question or "",
+            pack={"_answer_source": "pdf_export"},
+        )
+    except Exception:
+        logger.exception("pdf_export finalize failed; continuing")
+    try:
+        from app.services.surface_quality import run_surface_quality_gate
+        answer, issues, fixes = run_surface_quality_gate(
+            answer,
+            question=req.question or "",
+            hard_block=True,
+        )
+        quality_blocked = any("hard_block" in str(f) for f in (fixes or []))
+        if issues:
+            logger.info(
+                "pdf_export quality_gate issues=%s fixes=%s",
+                [i.get("code") for i in issues], fixes,
+            )
+    except Exception:
+        logger.exception("pdf_export quality_gate failed; rendering as-is")
+    try:
+        from app.services.quality_metrics import record_export
+        record_export(kind="pdf", quality_blocked=quality_blocked)
+    except Exception:
+        pass
     try:
         pdf_bytes = await asyncio.to_thread(
-            render_pdf, req.question, req.answer, req.web_sources,
+            render_pdf, req.question, answer, req.web_sources,
         )
     except Exception:
         # Log the real cause server-side, but never leak raw exception
@@ -260,6 +295,79 @@ async def export_pdf(req: PdfExportRequest):
             "Cache-Control": "no-store",
         },
     )
+
+
+class DocxExportRequest(BaseModel):
+    question: str
+    answer: str
+
+
+@router.post(
+    "/export/docx",
+    summary="Render a chat briefing as a downloadable Word document",
+    dependencies=[Depends(_pdf_rl), Depends(require_role(ROLE_ANALYST))],
+    responses={429: {"description": "Rate limit exceeded."}},
+)
+async def export_docx(req: DocxExportRequest):
+    """Quality-gated DOCX export (requires python-docx)."""
+    from fastapi import HTTPException
+    from fastapi.responses import Response
+    answer = req.answer or ""
+    try:
+        from app.services.answer_finalize import finalize_answer
+        answer = finalize_answer(
+            answer,
+            user_question=req.question or "",
+            pack={"_answer_source": "docx_export"},
+        )
+    except Exception:
+        logger.exception("docx_export finalize failed; continuing")
+    try:
+        from app.services.surface_quality import run_surface_quality_gate
+        answer, _issues, _fixes = run_surface_quality_gate(
+            answer,
+            question=req.question or "",
+            hard_block=True,
+        )
+    except Exception:
+        logger.exception("docx_export quality_gate failed; continuing")
+    try:
+        from app.services.docx_export import render_docx
+        docx_bytes = await asyncio.to_thread(
+            render_docx, req.question, answer,
+        )
+    except ImportError:
+        raise HTTPException(
+            status_code=501,
+            detail="Word export requires python-docx (dev dependency).",
+        )
+    except Exception:
+        logger.exception("DOCX render failed")
+        raise HTTPException(status_code=500, detail="DOCX rendering failed.")
+    import re
+    safe = re.sub(r"[^a-zA-Z0-9_\- ]+", "", req.question or "briefing")[:60].strip()
+    safe = re.sub(r"\s+", "-", safe) or "briefing"
+    return Response(
+        content=docx_bytes,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="MISA-{safe}.docx"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get(
+    "/quality/metrics",
+    summary="In-process quality / retrieval metrics snapshot",
+    dependencies=[Depends(_questions_rl), Depends(require_role(ROLE_ANALYST))],
+)
+async def quality_metrics():
+    from app.services.quality_metrics import snapshot
+    return snapshot()
 
 
 @router.post(
@@ -452,13 +560,24 @@ def _pack_answer_sources(result: dict | None) -> tuple[list[dict], list[dict]]:
     return unified, clickable
 
 
-def _polish_answer(answer: str, *, keep_citations: bool = False) -> str:
-    """Post-process streaming / legacy answers through the style scrubber."""
+def _polish_answer(
+    answer: str,
+    *,
+    keep_citations: bool = False,
+    deliverable: str | None = None,
+    answer_source: str | None = None,
+) -> str:
+    """Post-process answers through the style scrubber (collapse-safe)."""
     if not answer:
         return answer
     try:
         from app.services.curation import _scrub_backend_noise
-        return _scrub_backend_noise(answer, keep_citations=keep_citations)
+        return _scrub_backend_noise(
+            answer,
+            keep_citations=keep_citations,
+            deliverable=deliverable,
+            answer_source=answer_source,
+        )
     except Exception:
         return answer
 
@@ -547,7 +666,8 @@ async def _prepare_fast_stream(req: ChatRequest):
 
     depth, _ = detect_depth(user_q)
     summary = bundle_summary_for_prompt(bundle)
-    primary_row = summary.get("primary") or {}
+    from app.services.db_briefing import rows_from_correlator_summary
+    rows = rows_from_correlator_summary(summary)
     return {
         "client": client,
         "model": OPENAI_MODEL,
@@ -555,51 +675,154 @@ async def _prepare_fast_stream(req: ChatRequest):
         "target": target,
         "canon": canon,
         "depth": depth,
-        "rows": [primary_row],
+        "rows": rows,
     }
 
 
 async def _stream_fast_path(req: ChatRequest, prep: dict) -> AsyncGenerator[str, None]:
-    """Stream the curation LLM call as SSE chunk events using the
-    prep state from _prepare_fast_stream(). Yields status + chunk +
-    done events. NEVER returns a value (it's an async generator)."""
+    """Compose a company briefing, then stream ONLY the repaired final text.
+
+    Azure tokens are buffered off-screen. soft_check + deterministic fallback
+    + finalize run before any answer chunk reaches the client — so the UI
+    never flashes a thin draft that later gets replaced.
+    """
+    from app.services.db_briefing import (
+        render_db_briefing, use_deterministic_db_briefing,
+    )
     from app.services.streaming_curation import stream_company_insights_chunks
 
+    label = prep.get("canon") or prep.get("target") or "entity"
     yield _sse({"type": "status",
-                "message": f"Composing briefing for {prep['canon'] or prep['target']}…"})
+                "message": f"Composing briefing for {label}…"})
 
-    loop = asyncio.get_event_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-    SENTINEL = object()
+    from app.services.llm_residency import narrative_cloud_enabled
 
-    def _producer():
+    prefer_templates = (
+        use_deterministic_db_briefing() and not narrative_cloud_enabled()
+    )
+
+    assembled = ""
+    if prefer_templates:
         try:
-            for chunk in stream_company_insights_chunks(
-                prep["rows"], req.question,
-                locale=req.locale or "en",
-                entity_candidate=prep["target"],
-                entity_matched=prep["canon"] or prep["target"],
+            assembled = render_db_briefing(
+                prep.get("rows") or [],
+                intent=prep.get("intent"),
                 table="company_profiles",
-                client=prep["client"], model=prep["model"],
-                intent=prep["intent"], depth=prep["depth"],
-            ):
-                queue.put_nowait(chunk)
+                user_question=req.question,
+                locale=req.locale or "en",
+            ) or ""
         except Exception:
-            pass
-        queue.put_nowait(SENTINEL)
+            assembled = ""
+        if assembled:
+            try:
+                from app.services.hybrid_briefing import enrich_db_briefing
+                enriched = enrich_db_briefing(
+                    assembled,
+                    req.question,
+                    entity_hint=str(prep.get("canon") or prep.get("target") or ""),
+                )
+                assembled = enriched.get("answer") or assembled
+            except Exception:
+                pass
+    else:
+        yield _sse({"type": "status",
+                    "message": f"Generating narrative for {label}…"})
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        SENTINEL = object()
 
-    loop.run_in_executor(None, _producer)
+        def _producer():
+            try:
+                for chunk in stream_company_insights_chunks(
+                    prep["rows"], req.question,
+                    locale=req.locale or "en",
+                    entity_candidate=prep["target"],
+                    entity_matched=prep["canon"] or prep["target"],
+                    table="company_profiles",
+                    client=prep["client"], model=prep["model"],
+                    intent=prep["intent"], depth=prep["depth"],
+                ):
+                    queue.put_nowait(chunk)
+            except Exception:
+                pass
+            queue.put_nowait(SENTINEL)
 
-    streamed_anything = False
-    while True:
-        chunk = await queue.get()
-        if chunk is SENTINEL:
-            break
-        streamed_anything = True
+        loop.run_in_executor(None, _producer)
+        buf: list[str] = []
+        while True:
+            chunk = await queue.get()
+            if chunk is SENTINEL:
+                break
+            buf.append(chunk)
+        assembled = "".join(buf)
+
+    if not assembled.strip():
+        # Last resort: force deterministic template
+        try:
+            assembled = render_db_briefing(
+                prep.get("rows") or [],
+                intent=prep.get("intent"),
+                table="company_profiles",
+                user_question=req.question,
+                locale=req.locale or "en",
+                force=True,
+            ) or ""
+        except Exception:
+            assembled = ""
+
+    pack = {
+        "_answer_source": "db",
+        "_fast_stream": True,
+        "_intent": prep.get("intent"),
+        "_depth": prep.get("depth"),
+    }
+    yield _sse({"type": "status",
+                "message": "Quality-checking briefing…"})
+    try:
+        from app.services.stream_repair import repair_company_answer_if_thin
+        assembled, repair_fixes = repair_company_answer_if_thin(
+            assembled,
+            question=req.question,
+            intent=prep.get("intent"),
+            rows=prep.get("rows") or [],
+            locale=req.locale or "en",
+            pack=pack,
+        )
+        if repair_fixes:
+            pack["_stream_repair_fixes"] = repair_fixes
+    except Exception:
+        pass
+    try:
+        from app.services.answer_finalize import finalize_answer
+        assembled = finalize_answer(
+            assembled, user_question=req.question, pack=pack,
+        )
+    except Exception:
+        pass
+    try:
+        assembled = _polish_answer(
+            assembled,
+            keep_citations=bool(pack.get("_web_sources")),
+            answer_source=pack.get("_answer_source") or "db",
+        )
+    except Exception:
+        pass
+
+    if not assembled.strip():
+        yield _sse({"type": "done", "trace": [], "_pack": pack})
+        return
+
+    # Only NOW stream answer text — the repaired, finalized brief.
+    parts = [p for p in assembled.split("\n\n") if p.strip()] or [assembled]
+    for i, part in enumerate(parts):
+        chunk = part if i == len(parts) - 1 else part + "\n\n"
         yield _sse({"type": "chunk", "text": chunk})
-
-    if streamed_anything:
-        yield _sse({"type": "done", "trace": []})
+    yield _sse({
+        "type": "done",
+        "trace": [],
+        "_pack": pack,
+        "_final_answer": assembled,
+    })
 
 
 async def _chat_sse_generator(
@@ -615,9 +838,16 @@ async def _chat_sse_generator(
         _hist, pre_state, sid, hist_meta = _prepare_session_history(
             user, req.session_id, req.question, history,
         )
-        # Collect streamed text for session persistence; replace the
-        # fast-path "done" with one that includes session_id.
+        # Collect streamed text for session persistence. Answer chunks are
+        # already repaired+finalized inside _stream_fast_path — never flash
+        # a raw Azure draft to the client.
         parts: list[str] = []
+        stream_pack: dict = {
+            "_answer_source": "db",
+            "_fast_stream": True,
+            "_intent": prep.get("intent"),
+            "_depth": prep.get("depth"),
+        }
         async for evt in _stream_fast_path(req, prep):
             try:
                 line = evt.strip()
@@ -629,20 +859,47 @@ async def _chat_sse_generator(
                     parts.append(payload["text"])
                     yield evt
                 elif payload.get("type") == "done":
+                    if isinstance(payload.get("_pack"), dict):
+                        stream_pack.update(payload["_pack"])
+                    if payload.get("_final_answer"):
+                        parts = [str(payload["_final_answer"])]
                     continue
                 else:
                     yield evt
             except Exception:
                 yield evt
-        answer = "".join(parts)
-        answer = _polish_answer(answer, keep_citations=False)
-        # Synthetic result so DB table from the fast path shows in Sources.
+        answer = parts[0] if len(parts) == 1 else "".join(parts)
+        pack = stream_pack
+        # Already repaired+finalized in _stream_fast_path; only recover if empty.
+        if not (answer or "").strip():
+            try:
+                from app.services.stream_repair import repair_company_answer_if_thin
+                from app.services.answer_finalize import finalize_answer
+                answer, _ = repair_company_answer_if_thin(
+                    "",
+                    question=req.question,
+                    intent=prep.get("intent"),
+                    rows=prep.get("rows") or [],
+                    locale=req.locale or "en",
+                    pack=pack,
+                )
+                answer = finalize_answer(
+                    answer, user_question=req.question, pack=pack,
+                )
+            except Exception:
+                pass
+        answer = _polish_answer(
+            answer,
+            keep_citations=bool(pack.get("_web_sources")),
+            answer_source=pack.get("_answer_source") or "db",
+        )
         fake_result = {
-            "_answer_source": "db",
+            "_answer_source": pack.get("_answer_source") or "db",
             "tool_calls": [{
                 "table": "company_profiles",
                 "row_count": len(prep.get("rows") or []),
             }],
+            "_web_sources": pack.get("_web_sources"),
         }
         sources, clickable = _pack_answer_sources(fake_result)
         post_state, summary = _finalize_state(
@@ -699,7 +956,15 @@ async def _chat_sse_generator(
 
     sources, clickable = _pack_answer_sources(result)
     keep_cites = any(s.get("type") in ("web", "document") for s in sources)
-    answer = _polish_answer(result.get("answer") or "", keep_citations=keep_cites)
+    answer = _polish_answer(
+        result.get("answer") or "",
+        keep_citations=keep_cites,
+        deliverable=(
+            (result.get("feedback_context") or {}).get("advisory_deliverable")
+            if isinstance(result.get("feedback_context"), dict) else None
+        ) or result.get("_advisory_deliverable"),
+        answer_source=result.get("_answer_source"),
+    )
     if not answer.strip():
         yield _sse({
             "type": "error",
@@ -711,6 +976,10 @@ async def _chat_sse_generator(
     for para in answer.split("\n\n"):
         if para.strip():
             yield _sse({"type": "chunk", "text": para + "\n\n"})
+
+    # Ensure the UI replaces any mid-stream markdown-parse artefacts
+    # with the complete polished answer (critical for long tables).
+    yield _sse({"type": "final", "text": answer})
 
     post_state, summary = _finalize_state(pre_state, req.question, result)
     out_sid = _persist_chat_turn(
@@ -802,7 +1071,10 @@ async def chat_endpoint(req: ChatRequest, user: str = Depends(verify_credentials
         sources, clickable = _pack_answer_sources(result)
         keep_cites = any(s.get("type") in ("web", "document") for s in sources)
         polished = _polish_answer(
-            result.get("answer") or "", keep_citations=keep_cites,
+            result.get("answer") or "",
+            keep_citations=keep_cites,
+            deliverable=result.get("_advisory_deliverable"),
+            answer_source=result.get("_answer_source"),
         )
         post_state, summary = _finalize_state(pre_state, req.question, {
             **(result or {}),
@@ -829,6 +1101,25 @@ async def chat_endpoint(req: ChatRequest, user: str = Depends(verify_credentials
             web_sources=clickable or None,
             sources=sources or None,
             session_id=out_sid,
+            trace_id=result.get("_trace_id"),
+            intent=result.get("_query_intent"),
+            retrieval_status=(
+                (result.get("_retrieval") or {}).get("retrieval_status")
+                if isinstance(result.get("_retrieval"), dict)
+                else result.get("_retrieval_status")
+            ),
+            quality={
+                "gate": result.get("_quality_gate"),
+                "eval": result.get("_quality_eval"),
+                "truncated": bool(result.get("_truncated")),
+                "degraded": result.get("_degraded"),
+            } if (
+                result.get("_quality_gate")
+                or result.get("_quality_eval")
+                or result.get("_truncated")
+                or result.get("_degraded")
+            ) else None,
+            data_limitations=result.get("_data_limitations"),
         )
 
     return StreamingResponse(

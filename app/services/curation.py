@@ -34,6 +34,19 @@ from app.prompts.chat_system import (
     fallback_system_prompt,
 )
 
+
+def _llm_create(client, **kwargs):
+    """chat.completions.create with PII/secret masking on non-system msgs."""
+    try:
+        from app.services.prompt_masking import mask_messages_for_llm
+        msgs = kwargs.get("messages")
+        if msgs is not None:
+            kwargs = {**kwargs, "messages": mask_messages_for_llm(msgs)}
+    except Exception:
+        pass
+    return client.chat.completions.create(**kwargs)
+
+
 # Field-name substrings that must NEVER be sent to OpenAI (internal notes,
 # reviewer/audit metadata, external source paths). Mirrors the suppression list
 # used by deterministic commentary, plus internal free-text comment fields.
@@ -69,7 +82,15 @@ def _safe_value(v: Any) -> Any:
         return None
     if isinstance(v, str):
         s = v.strip()
-        return s[:_MAX_TEXT_CHARS] if s else None
+        if not s:
+            return None
+        s = s[:_MAX_TEXT_CHARS]
+        try:
+            from app.services.prompt_masking import mask_text
+            s = mask_text(s)
+        except Exception:
+            pass
+        return s
     if isinstance(v, dict):
         out: dict[str, Any] = {}
         for k, vv in v.items():
@@ -126,6 +147,155 @@ def safe_rows_for_curation(rows: list[dict]) -> list[dict]:
     """Public helper (also handy for tests): redact + cap a list of rows."""
     capped = list(rows or [])[:CHAT_CURATION_MAX_ROWS]
     return [_annotate_country_fks(r) for r in (_safe_row(r) for r in capped) if r]
+
+
+# Company-profile identity fields kept for person briefs (employer name only).
+_PERSON_BRIEF_COMPANY_KEYS = frozenset({
+    "id", "company_name", "company_name_ar", "name", "sector", "sector_name",
+    "global_headquarters", "hq_city", "hq_country", "is_rhq", "rhq_status",
+    "rhq_city", "rhq_country", "licensed", "role",
+})
+
+# Tables / row shapes that belong in a person brief payload.
+_PERSON_BRIEF_NAME_KEYS = (
+    "full_name", "executive_name", "person_name", "contact_name",
+    "name", "first_name", "last_name", "ceo_name",
+)
+_PERSON_BRIEF_TITLE_KEYS = (
+    "title", "role", "position", "designation", "current_title",
+    "exec_title", "job_title",
+)
+
+
+def slim_rows_for_person_brief(rows: list[dict]) -> list[dict]:
+    """Keep people rows + a slim employer identity; drop company dumps.
+
+    'Who is the CEO of Apple?' must not feed meetings / MENA headcount /
+    product history into the curator — local models then emit a company
+    briefing with a two-line Role bolted on.
+    """
+    if not rows:
+        return []
+    people: list[dict] = []
+    companies: list[dict] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        keys_lc = {str(k).lower() for k in r.keys()}
+        looks_like_person = any(k in keys_lc for k in _PERSON_BRIEF_NAME_KEYS) and (
+            any(k in keys_lc for k in _PERSON_BRIEF_TITLE_KEYS)
+            or "company_profile_id" in keys_lc
+            or "tenure" in keys_lc
+        )
+        looks_like_company = (
+            "company_name" in keys_lc
+            and not looks_like_person
+            and (
+                "sector" in keys_lc
+                or "is_rhq" in keys_lc
+                or "global_headquarters" in keys_lc
+                or "licensed" in keys_lc
+                or "number_of_employees" in keys_lc
+                or "employees_in_mena" in keys_lc
+            )
+        )
+        if looks_like_person:
+            people.append(r)
+        elif looks_like_company:
+            slim = {
+                k: v for k, v in r.items()
+                if str(k).lower() in _PERSON_BRIEF_COMPANY_KEYS and v is not None
+            }
+            if slim:
+                companies.append(slim)
+        # Drop meetings / contacts / opportunities / news / ai_insights.
+    # Prefer people rows; keep at most one slim company identity card.
+    out = list(people)
+    if companies:
+        out.append(companies[0])
+    return out or rows[:3]
+
+
+_COMPANY_ONLY_SECTION_HEADERS = re.compile(
+    r"(?im)^##+\s*(?:"
+    r"Saudi\s*/\s*MENA Position"
+    r"|Economic Outlook"
+    r"|Policy\s*(?:&|and)\s*Regulatory"
+    r"|Engagement History"
+    r"|MISA Contacts"
+    r"|Open Action Items"
+    r"|Companies\s*(?:&|and)\s*Investors"
+    r"|Snapshot"
+    r"|Corporate Profile.*"
+    r"|Regional Footprint.*"
+    r"|.+—\s*Executive Briefing"
+    r")\s*$"
+)
+
+
+def _keep_person_role_only(answer: str) -> str:
+    """DEPRECATED — never call. Kept only so import sites fail loudly in tests.
+
+    Role-only stripping destroyed Jul21 person depth. Person briefs must keep
+    Role + Background + Strategic Read (+ Strategic Context / Recommended
+    Next Actions when present).
+    """
+    return answer
+
+
+def _strip_company_sections_from_person_brief(answer: str) -> str:
+    """If a person brief grew company lanes, keep Role/Background/Strategic Read."""
+    if not answer:
+        return answer
+    if not re.search(r"(?im)^##+\s*Role\s*$", answer):
+        return answer
+    section_re = re.compile(r"(?m)^(##+\s+[^\n]+)\n?")
+    tokens = section_re.split(answer)
+    if len(tokens) < 2:
+        return answer
+    # Jul21 person briefs carry Strategic Context + Recommended Next
+    # Actions alongside Role / Background / Strategic Read. Do NOT strip
+    # those — the router polish re-runs this scrub after finalize injects
+    # them, and dropping them was the regression that left CEO answers thin.
+    keep_headers = re.compile(
+        r"(?im)^##+\s*(?:"
+        r"Role"
+        r"|Background"
+        r"|Strategic Context"
+        r"|🇸🇦\s*Strategic Read"
+        r"|Strategic Read"
+        r"|Recommended Next Actions(?:\s+for\s+MISA)?"
+        r"|Recommended Next Moves(?:\s+for\s+MISA)?"
+        r")\s*$"
+    )
+    out: list[str] = [tokens[0]]
+    for i in range(1, len(tokens), 2):
+        header = tokens[i]
+        body = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if keep_headers.match(header.strip()):
+            out.append(header if header.endswith("\n") else header + "\n")
+            if body and not body.startswith("\n"):
+                out.append("\n")
+            out.append(body)
+            continue
+        if _COMPANY_ONLY_SECTION_HEADERS.match(header.strip()):
+            continue
+        # Unknown headers: keep only if short (footer / Sources).
+        if re.search(r"(?i)sources?", header) or len((body or "").strip()) < 40:
+            out.append(header if header.endswith("\n") else header + "\n")
+            if body and not body.startswith("\n"):
+                out.append("\n")
+            out.append(body)
+    text = "".join(out)
+    # Drop the "All figures per the MISA record…" disclaimer when bolted on.
+    text = re.sub(
+        r"(?im)^\s*All figures per the MISA record[^\n]*\n+",
+        "",
+        text,
+    )
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text.strip()
 
 
 def redact_rows_for_response(rows: list[dict]) -> list[dict]:
@@ -201,7 +371,13 @@ def repair_markdown_formatting(answer: str) -> str:
     return re.sub(r"(?<=[A-Za-z0-9)])\*\*(?=[A-Z])", "** — ", answer)
 
 
-def _scrub_backend_noise(answer: str, *, keep_citations: bool = False) -> str:
+def _scrub_backend_noise(
+    answer: str,
+    *,
+    keep_citations: bool = False,
+    deliverable: str | None = None,
+    answer_source: str | None = None,
+) -> str:
     """Defence in depth for the executive-briefing data hygiene rules.
     The curation prompt forbids confidence tags / web-citation handles /
     "Source: DB" / "Not available in the current database." in output,
@@ -287,10 +463,227 @@ def _scrub_backend_noise(answer: str, *, keep_citations: bool = False) -> str:
         r"^##+\s*Sources\s*&\s*Gaps[^\n]*\n\s*\Z",
         "", text, flags=_re.IGNORECASE | _re.MULTILINE,
     )
+    # 5c. Drop empty document/web/MISA source lanes the model invents
+    #     when those sources were never consulted (or returned nothing).
+    text = _strip_empty_source_lanes(text)
+    # Person briefs that grew company lanes (common with local models
+    # when company_profiles rows are in the payload).
+    text = _strip_company_sections_from_person_brief(text)
+    # 5d. Collapse Ollama section-loops — but NEVER mid-cut advisory docs.
+    text = collapse_repetitive_briefing(
+        text, deliverable=deliverable, answer_source=answer_source,
+    )
     # 7. Collapse triple-blank lines created by strips
     while "\n\n\n" in text:
         text = text.replace("\n\n\n", "\n\n")
     return text.strip() + ("\n" if text.endswith("\n") else "")
+
+
+_EMPTY_SOURCE_LANE_HEADER_RE = re.compile(
+    r"(?im)^##+\s*(?:"
+    r"From your documents"
+    r"|From the web"
+    r"|From MISA data"
+    r"|What'?s Reported\s*\(Live Web\)"
+    r"|Live Web"
+    r"|Supporting reporting"
+    r")\s*$"
+)
+
+_EMPTY_SOURCE_BODY_RE = re.compile(
+    r"(?is)^\s*(?:"
+    r"[_*]{0,2}No relevant (?:documents?|document excerpts?|information|results?|sources?)(?:\s+\w+){0,12}\.?[_*]{0,2}"
+    r"|[_*]{0,2}No (?:reliable |usable )?web (?:sources?|results?)[^.]*\.?[_*]{0,2}"
+    r"|[_*]{0,2}Not available from the web\.?[_*]{0,2}"
+    r"|[_*]{0,2}No documents?(?:\s+\w+){0,8}\.?[_*]{0,2}"
+    r"|Treat any database[^.]*(?:unverified|lag)\.?"
+    r"|_?Sources?:\s*[^.\n]+\.?"
+    r")\s*$"
+)
+
+
+def _norm_section_key(header: str) -> str:
+    h = re.sub(r"^#+\s*", "", (header or "").strip()).lower()
+    h = re.sub(r"\s+", " ", h)
+    # Collapse emoji / punctuation variants of Strategic Read.
+    if "strategic read" in h:
+        return "strategic read"
+    if "what" in h and "reported" in h:
+        return "whats reported"
+    if "from your documents" in h:
+        return "from documents"
+    if "from the web" in h:
+        return "from web"
+    if "from misa" in h:
+        return "from misa"
+    if "supporting reporting" in h:
+        return "supporting reporting"
+    if "companies" in h and "investor" in h:
+        return "companies investors"
+    if "saudi" in h and "mena" in h:
+        return "saudi mena"
+    return h
+
+
+def collapse_repetitive_briefing(
+    answer: str,
+    *,
+    deliverable: str | None = None,
+    answer_source: str | None = None,
+) -> str:
+    """Kill Ollama section-loops: keep first copy of each section only.
+
+    llama3.1 often repeats the same ## Strategic Read / ## What's Reported /
+    ## Companies & Investors cycle for thousands of tokens. This is
+    defence-in-depth — never ship that to the user or PDF export.
+
+    Advisory / strategy documents skip the aggressive window cutter
+    entirely (see ``advisory_safety.should_skip_aggressive_collapse``).
+    """
+    if not answer or len(answer) < 200:
+        return answer
+
+    from app.services.advisory_safety import should_skip_aggressive_collapse
+    skip_window = should_skip_aggressive_collapse(
+        deliverable=deliverable,
+        answer=answer,
+        answer_source=answer_source,
+    )
+
+    if skip_window:
+        # Still allow light section-key dedupe below; never substring-cut.
+        pass
+    else:
+        # Fast path: identical long substrings repeating → cut at 2nd copy,
+        # then rewind to the last clean section header so we don't leave a
+        # truncated "## Strategic Re" stub.
+        for window in (280, 180, 120):
+            if len(answer) < window * 3:
+                continue
+            cut_at = None
+            for i in range(window, min(len(answer) - window * 2, 3500), 40):
+                piece = answer[i:i + window]
+                if len(piece.strip()) < window * 0.7:
+                    continue
+                second = answer.find(piece, i + window)
+                if second == -1:
+                    continue
+                third = answer.find(piece, second + window)
+                if third != -1:
+                    # Refuse to cut inside a markdown table row.
+                    line_start = answer.rfind("\n", 0, second) + 1
+                    if answer[line_start:second + 1].lstrip().startswith("|"):
+                        continue
+                    cut_at = second
+                    break
+            if cut_at is not None:
+                answer = answer[:cut_at].rstrip()
+                # Rewind to last complete heading line.
+                last_h = max(answer.rfind("\n##"), answer.rfind("\n###"))
+                if last_h > 0 and not answer[last_h + 1:].strip().endswith(("\n", ".", "_")):
+                    # If the final section body is empty/truncated, drop it.
+                    body = answer[last_h + 1:]
+                    if len(body.strip()) < 40 and "strategic" in body.lower():
+                        # Keep first Strategic Read earlier; drop this stub.
+                        # Actually this is the START of a truncated header —
+                        # drop from last_h.
+                        if body.count("\n") <= 1:
+                            answer = answer[:last_h].rstrip()
+                break
+
+    section_re = re.compile(r"(?m)^(#{1,3}\s+[^\n]+)\n?")
+    tokens = section_re.split(answer)
+    if len(tokens) < 2:
+        return answer.strip()
+
+    out: list[str] = [tokens[0]]
+    seen: set[str] = set()
+    junk_once = {
+        "from documents", "from web", "from misa",
+        "whats reported", "supporting reporting",
+    }
+    for i in range(1, len(tokens), 2):
+        header = tokens[i]
+        body = tokens[i + 1] if i + 1 < len(tokens) else ""
+        key = _norm_section_key(header)
+        body_core = re.sub(r"(?m)^\s*---\s*$", "", body).strip()
+        body_core = re.sub(r"^\*+|\*+$", "", body_core).strip()
+
+        # Drop junk source lanes entirely (never useful when empty / footer-only).
+        if key in junk_once:
+            if not body_core or _EMPTY_SOURCE_BODY_RE.match(body_core):
+                continue
+            # Even with content: keep at most once, and only if it has a URL
+            # or [web:N] / [doc:] citation — otherwise it's model hallucination.
+            if key in ("from documents", "from web", "from misa", "whats reported"):
+                if not re.search(r"(?i)(\[web:\d+\]|\[doc:|https?://)", body_core):
+                    continue
+
+        if key in seen:
+            continue  # duplicate section header — drop
+        seen.add(key)
+
+        out.append(header if header.endswith("\n") else header + "\n")
+        if body and not body.startswith("\n"):
+            out.append("\n")
+        out.append(body)
+
+    text = "".join(out)
+    # Deduplicate consecutive / earlier identical bullets.
+    lines = text.splitlines()
+    deduped: list[str] = []
+    prev_norm = ""
+    seen_bullets: set[str] = set()
+    for line in lines:
+        norm = re.sub(r"\s+", " ", line.strip().lower())
+        if norm and norm == prev_norm:
+            continue
+        is_bullet = norm[:1] in "-*•" or norm.startswith(("- ", "* ", "• "))
+        if is_bullet:
+            if norm in seen_bullets:
+                continue
+            seen_bullets.add(norm)
+        deduped.append(line)
+        prev_norm = norm
+    text = "\n".join(deduped)
+
+    # Drop a trailing truncated heading with no body.
+    text = re.sub(r"\n#{1,3}\s+\S[^\n]{0,40}\s*$", "", text)
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text.strip()
+
+
+def _strip_empty_source_lanes(answer: str) -> str:
+    """Remove ## From your documents / ## From the web stubs with no content.
+
+    Those headings are only useful with real excerpts or citations.
+    Empty 'no relevant…' lanes are noise — never required in the UI.
+    """
+    if not answer:
+        return answer
+    section_re = re.compile(r"(?m)^(##+\s+[^\n]+)\n?")
+    tokens = section_re.split(answer)
+    if len(tokens) < 2:
+        return answer
+    out: list[str] = [tokens[0]]
+    for i in range(1, len(tokens), 2):
+        header = tokens[i]
+        body = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if _EMPTY_SOURCE_LANE_HEADER_RE.match(header.strip()):
+            body_core = re.sub(r"(?m)^\s*---\s*$", "", body).strip()
+            # Drop italic/bold markdown wrappers for the emptiness check.
+            body_core = re.sub(r"^[_*]+|[_*]+$", "", body_core).strip()
+            if not body_core or _EMPTY_SOURCE_BODY_RE.match(body_core):
+                continue
+        out.append(header if header.endswith("\n") else header + "\n")
+        if body and not body.startswith("\n"):
+            out.append("\n")
+        out.append(body)
+    text = "".join(out)
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text.strip()
 
 
 def _strip_unsourced_bullets(answer: str, records_blob: str) -> str:
@@ -388,23 +781,72 @@ def _neutralise_unreliable_regional_revenue(answer: str, records_blob: str) -> s
     actually support it (see `_suspect_regional_revenue_tags`), rather than
     let a fabricated-looking or duplicate-of-global figure reach the user
     with just an inline hedge. Global and other regions are untouched — this
-    only fires on the specific tag(s) flagged as unreliable."""
+    only fires on the specific tag(s) flagged as unreliable.
+
+    Also strips invent-by-percentage MENA/Saudi dollars (e.g. '$39.1B
+    estimated MENA revenue (10% of global)') even when no regional
+    revenue field was present in the payload.
+    """
     if not answer:
         return answer
     suspect = _suspect_regional_revenue_tags(records_blob)
-    if not suspect:
-        return answer
+    # If payload has no trustworthy MENA/KSA revenue field at all, treat
+    # both regions as suspect for dollar invents in the answer.
+    if "mena" not in suspect and not re.search(
+        r'"(?:[a-z0-9_]*mena[a-z0-9_]*revenue[a-z0-9_]*|[a-z0-9_]*revenue[a-z0-9_]*mena[a-z0-9_]*)"\s*:\s*"?[1-9]',
+        records_blob or "",
+        re.I,
+    ):
+        suspect = set(suspect) | {"mena"}
+    if "ksa" not in suspect and not re.search(
+        r'"(?:[a-z0-9_]*(?:ksa|saudi)[a-z0-9_]*revenue[a-z0-9_]*|[a-z0-9_]*revenue[a-z0-9_]*(?:ksa|saudi)[a-z0-9_]*)"\s*:\s*"?[1-9]',
+        records_blob or "",
+        re.I,
+    ):
+        suspect = set(suspect) | {"ksa"}
+
     out_lines = []
     for line in answer.splitlines():
         m = _REGIONAL_REVENUE_LINE_RE.match(line)
-        if m and _REGION_CANON[m.group(1).lower()] in suspect:
+        if m and _REGION_CANON.get(m.group(1).lower()) in suspect:
             region = "Saudi" if m.group(1).lower() in ("saudi", "ksa") else "MENA"
             indent = line[: len(line) - len(line.lstrip())]
+            # Table cell form: keep row shape, rewrite MENA/Saudi cell.
+            if "|" in line and "Financials" in line:
+                parts = [p for p in line.split("|")]
+                if len(parts) >= 4:
+                    # | **Financials** | global | mena |
+                    parts[-2] = f" {region} revenue not separately reported "
+                    out_lines.append("|".join(parts))
+                    continue
             out_lines.append(
                 f"{indent}{region} revenue: not reliably recorded separately "
                 f"from global revenue in the database."
             )
             continue
+        # Catch "estimated MENA revenue ($X = Y% of global)" invents
+        if re.search(
+            r"(?i)\b(estimated|implied|approx(?:imate(?:ly)?)?)\b.{0,40}"
+            r"\b(mena|saudi|ksa)\b.{0,40}\brevenue\b.{0,40}\$",
+            line,
+        ) or re.search(
+            r"(?i)\b(mena|saudi|ksa)\b.{0,40}\brevenue\b.{0,40}"
+            r"\(\s*\d+(\.\d+)?\s*%\s+of\s+global",
+            line,
+        ):
+            if "|" in line and "Financials" in line:
+                parts = [p for p in line.split("|")]
+                if len(parts) >= 4:
+                    parts[-2] = " MENA revenue not separately reported "
+                    out_lines.append("|".join(parts))
+                    continue
+            line = re.sub(
+                r"(?i)\$\s?[\d,.]+\s*(?:B|M|bn|m)?\s*"
+                r"(?:estimated\s+)?(?:MENA|Saudi|KSA)\s+revenue"
+                r"(?:\s*\([^)]*\))?",
+                "MENA revenue not separately reported",
+                line,
+            )
         out_lines.append(line)
     return "\n".join(out_lines)
 
@@ -643,8 +1085,7 @@ def curate_company_insights(
     # Strategic Read section regardless of prompt pressure.
     from app.config import curation_model_for_depth
     # PERSON-QUESTION EXCEPTION: person briefings are template-critical
-    # (verbatim '## From the MISA Record' / '## Background (general
-    # knowledge)' headers carry the data-provenance guarantee). Two
+    # (canonical '## Role' / '## Background' / Strategic Read). Two
     # rules, keyed on the QUESTION being about a person — via people
     # table OR executive_lookup intent (multi-table merges often make
     # company_profiles the primary table for a person question):
@@ -652,6 +1093,8 @@ def curate_company_insights(
     #      the mandatory headers despite prompt pressure);
     #   2. force the people TEMPLATE (below) so the company template
     #      never overrides the provenance sections.
+    # FORBIDDEN legacy headers: 'From the MISA Record',
+    # 'Background (general knowledge)' — stripped by answer_finalize.
     _PEOPLE_TABLES = (
         "executives", "company_executives", "rhq_topexecutives",
         "board_positions", "contacts", "company_contact_records",
@@ -659,13 +1102,28 @@ def curate_company_insights(
         "misa_contact_details",
     )
     _person_question = (
-        table in _PEOPLE_TABLES or (intent or "") == "executive_lookup"
+        table in _PEOPLE_TABLES
+        or (intent or "") in ("executive_lookup", "person_lookup", "executive_succession")
     )
     if _person_question:
         if table not in _PEOPLE_TABLES:
             table = "company_executives"  # selects the people template
+        # Drop meetings / MENA / product dumps — keep people + slim employer.
+        safe = slim_rows_for_person_brief(safe) or safe
     else:
         model = curation_model_for_depth(depth, model)
+
+    # Narrative: privacy-filtered fact cards → Azure when NARRATIVE_CLOUD
+    # (Jul21 quality). Hard Ollama-only only when narrative cloud is off.
+    try:
+        from app.services.llm_residency import resolve_narrative_completion_client
+        client, model = resolve_narrative_completion_client(
+            client, preferred_model=model,
+        )
+    except Exception as e:
+        from app.logger import logger
+        logger.error(f"curation narrative-LLM resolve failed: {e}")
+        return None
 
     classification, matched_name = classify_match(entity_candidate, entity_matched, rows)
 
@@ -810,16 +1268,17 @@ def curate_company_insights(
         if missing_data_note:
             missing_data_note += "\n"
 
-    # DEPTH NOTE (Tier 3 commit 1) — same intent + different depth →
-    # different answer breadth. "Where is Apple's RHQ?" gets 3 lines;
-    # "Give me an executive briefing on Apple" gets the 10-section
-    # format. The depth note prepends to the intent note so the
-    # curator reads BREADTH-INTENT in that order.
+    # DEPTH NOTE — breadth before intent. For person briefs, never apply
+    # the "1–3 line simple_fact" depth note: Role + Background is the
+    # Jul21 minimum even for "Who is the CEO of X?".
     depth_note = ""
-    if depth:
+    _depth_for_note = depth
+    if _person_question and (depth or "") == "simple_fact":
+        _depth_for_note = "operational_detail"
+    if _depth_for_note:
         try:
             from app.services.depth_detector import depth_note_for_curation
-            depth_note = depth_note_for_curation(depth)
+            depth_note = depth_note_for_curation(_depth_for_note)
             if depth_note:
                 depth_note += "\n"
         except Exception:
@@ -828,12 +1287,35 @@ def curate_company_insights(
     payload = json.dumps(safe, ensure_ascii=False, default=str)
     table_label = f"`{table}`" if table else "the database"
 
+    anti_loop_note = ""
+    try:
+        from app.services.llm_residency import (
+            is_local_data_backend, narrative_cloud_enabled,
+        )
+        # Only when the compose client is actually Ollama — not when
+        # Jul21 narrative cloud routes privacy-filtered cards to Azure.
+        if is_local_data_backend() and not narrative_cloud_enabled():
+            anti_loop_note = (
+                "HARD STOP (local model): Write EACH section at most ONCE. "
+                "Order: ## <Company> — Executive Briefing → Corporate "
+                "Profile table → ### Snapshot of Operations and Market "
+                "Position (7+ bullets) → ONE ### 🇸🇦 Strategic Read "
+                "(2-4 bullets) → one _Sources_ line. "
+                "Then STOP. Never repeat Strategic Read. Never invent "
+                "'From your documents', 'From the web', 'From MISA data', "
+                "'What's Reported', or 'Supporting reporting' unless you "
+                "have real citations. Do not pad.\n\n"
+            )
+    except Exception:
+        pass
+
     def _run_once(extra_directive: str = "") -> str | None:
         """One full curation call. Wrapped so the response-validator
         regeneration path can re-invoke with stricter direction."""
         uc = (
             f"User question:\n{user_question}\n\n"
             f"{extra_directive}"
+            f"{anti_loop_note}"
             f"{depth_note}"
             f"{intent_note}"
             f"{market_intel_note}"
@@ -842,7 +1324,19 @@ def curate_company_insights(
             f"Retrieved records from {table_label} (privacy-filtered JSON):\n{payload}"
         )
         try:
-            r = client.chat.completions.create(
+            # Deep company / person / engagement briefs need the advisory
+            # token budget — 3072 truncates Snapshot of Operations mid-body.
+            _deep = (depth or "") != "simple_fact" and (intent or "") in (
+                "company_profile", "saudi_presence", "financial_lookup",
+                "opportunity_alignment", "relationship_intelligence",
+                "engagement_strategy", "executive_lookup",
+                "executive_succession", "person_lookup", "entity_lookup",
+            )
+            _tok = (
+                openai_advisory_max_tokens_kw()
+                if _deep else openai_max_completion_tokens_kw()
+            )
+            r = _llm_create(client,
                 model=model,
                 messages=[
                     {"role": "system", "content": curation_system_prompt(locale, table)},
@@ -850,7 +1344,7 @@ def curate_company_insights(
                 ],
                 store=CHAT_OPENAI_STORE,
                 **openai_determinism_kw(),
-                **openai_max_completion_tokens_kw(),
+                **_tok,
             )
         except Exception:
             return None
@@ -870,6 +1364,11 @@ def curate_company_insights(
         # regardless of model adherence. See _scrub_backend_noise.
         t = _scrub_backend_noise(t)
         t = repair_markdown_formatting(t)
+        if _person_question:
+            # Keep Role + Background + Strategic Read; drop company-shaped
+            # lanes that leaked into a person brief. Never Role-only —
+            # that was an Ollama shortcut that destroyed Jul21 quality.
+            t = _strip_company_sections_from_person_brief(t)
         return t
 
     text = _run_once()
@@ -894,16 +1393,31 @@ def curate_company_insights(
     # a directive, where the validator's safety net is highest value.
     # Golden tests pin the lead-with-the-answer behaviour without
     # paying per-turn validator latency.
+    # Auto-enable first-paragraph validation for advisory intents
+    # (fail-closed on validator errors). Other intents stay opt-in via env.
     import os as _os
     _validate_on = (_os.getenv("MISA_CHAT_VALIDATE") or "").strip().lower() in (
         "1", "true", "yes",
     )
-    if _validate_on and intent and intent == "general_research":
+    _fail_closed_intents = {
+        "company_targeting", "strategic_advisory", "market_fit",
+        "engagement_plan", "general_research",
+    }
+    _auto_validate = (intent or "") in _fail_closed_intents or bool(
+        intent and "advisory" in str(intent)
+    )
+    if (_validate_on or _auto_validate) and intent:
         try:
             from app.services.response_validator import validate_first_paragraph
-            verdict = validate_first_paragraph(user_question, text, client, model)
+            verdict = validate_first_paragraph(
+                user_question, text, client, model,
+                fail_closed=_auto_validate,
+            )
         except Exception:
-            verdict = {"is_relevant": True}
+            verdict = {
+                "is_relevant": not _auto_validate,
+                "reason": "validator exception",
+            }
         if not verdict.get("is_relevant", True):
             stricter = (
                 "REGENERATION (PRIOR ANSWER REJECTED): A previous draft of "
@@ -918,6 +1432,9 @@ def curate_company_insights(
             retry = _run_once(stricter)
             if retry:
                 text = retry
+            elif _auto_validate:
+                # Fail closed: keep original; quality_gate/finalize will harden
+                pass
 
     # STYLE VALIDATOR (Tier 1 commit 3/3) — runs on EVERY curated
     # answer regardless of intent. Checks find_style_violations() from
@@ -1009,7 +1526,7 @@ def general_knowledge_answer(
 ) -> str | None:
     """Answer from model knowledge when the DB has no rows. None on failure."""
     try:
-        resp = client.chat.completions.create(
+        resp = _llm_create(client,
             model=model,
             messages=[
                 {"role": "system", "content": fallback_system_prompt(locale)},
@@ -1051,11 +1568,46 @@ def strategic_advisory_answer(
     section in real figures instead of generic prose.
     """
     user_content = user_question
-    if db_context:
+    if db_context and db_context.get("footprint_data_unavailable"):
+        user_content += (
+            "\n\n---\nNOTE: MISA licensed/RHQ footprint counts for this "
+            "origin country are temporarily UNAVAILABLE (retrieval "
+            "failed). Do NOT invent counts and do NOT claim zero "
+            "companies licensed or zero RHQs — that would confuse "
+            "'data retrieval failed' with '0 verified records'. "
+            "Omit the footprint counts, or state that internal data "
+            "could not be retrieved.\n"
+            + json.dumps(
+                {k: v for k, v in db_context.items()
+                 if k not in (
+                     "companies_from_origin_licensed_in_saudi",
+                     "companies_from_origin_with_rhq",
+                     "top_rhq_companies",
+                     "top_licensed_companies",
+                     "expansion_targets",
+                     "_db_error",
+                 )},
+                default=str, ensure_ascii=False,
+            )
+        )
+    elif db_context and db_context.get("retrieval_status") == "zero_records":
+        user_content += (
+            "\n\n---\nMISA DATABASE CONTEXT — retrieval_status="
+            "zero_records. The query succeeded and returned 0 verified "
+            "licensed/RHQ records for the stated filters. You MAY say "
+            "zero, but MUST name the source and filters "
+            f"({json.dumps(db_context.get('retrieval_filters') or {}, default=str)}). "
+            "Do NOT invent positive footprint counts.\n"
+            + json.dumps(db_context, default=str, ensure_ascii=False)
+        )
+    elif db_context:
         user_content += (
             "\n\n---\nMISA DATABASE CONTEXT (system of record — cite "
-            "these figures in the 'Current MISA Footprint' section; do "
-            "not alter them):\n"
+            "these figures in the 'Current MISA Footprint' / "
+            "'Current Saudi Footprint' section; do not alter them). "
+            "SOURCE PRIORITY: (1) this MISA context, (2) official Saudi "
+            "sources, (3) reliable external market info, (4) general "
+            "knowledge only for colour — never override (1).\n"
             + json.dumps(db_context, default=str, ensure_ascii=False)
         )
     else:
@@ -1070,7 +1622,28 @@ def strategic_advisory_answer(
             "knowledge only."
         )
     try:
-        resp = client.chat.completions.create(
+        # DB context attached → narrative client (Azure fact-card path
+        # when NARRATIVE_CLOUD; else local Ollama).
+        if db_context:
+            from app.services.llm_residency import resolve_narrative_completion_client
+            client, model = resolve_narrative_completion_client(
+                client, preferred_model=model,
+            )
+
+        # Company-targeting: prefer validated JSON → markdown so PDF
+        # tables are built from structured rows, not fragile pipes.
+        if deliverable == "company_targeting":
+            structured_md = _company_targeting_structured_answer(
+                user_content=user_content,
+                db_context=db_context,
+                locale=locale,
+                client=client,
+                model=model,
+            )
+            if structured_md:
+                return structured_md
+
+        resp = _llm_create(client,
             model=model,
             messages=[
                 {"role": "system",
@@ -1084,3 +1657,116 @@ def strategic_advisory_answer(
     except Exception:
         return None
     return repair_markdown_formatting(_chat_text(resp))
+
+
+def _company_targeting_structured_answer(
+    *,
+    user_content: str,
+    db_context: dict | None,
+    locale: str,
+    client: OpenAI,
+    model: str,
+) -> str | None:
+    """DB-seeded complete report + compact LLM thesis enrichment.
+
+    The ranking table / footprint are assembled in code so a token-limit
+    mid-generation can never cut the answer mid-table (the UI regression
+    that showed only 1–2 incomplete ranking rows).
+    """
+    from app.services.advisory_structured import (
+        company_targeting_json_system_addon,
+        extract_json_object,
+        merge_thesis_enrichment,
+        render_company_targeting_markdown,
+        seed_company_targeting_payload_from_db,
+    )
+
+    seed = seed_company_targeting_payload_from_db(db_context)
+    if seed is None:
+        return None
+
+    company_names = [t["company"] for t in seed.get("targets") or []]
+    enrich_user = (
+        user_content
+        + "\n\n---\nWrite SHORT theses ONLY for these exact companies "
+        "(already in the MISA footprint — treat as expansion targets):\n"
+        + "\n".join(f"- {n}" for n in company_names[:10])
+        + "\nYou may add up to 3 new_entry_targets not listed above.\n"
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a MISA investment-attraction strategist. "
+                "Return compact JSON only.\n"
+                + company_targeting_json_system_addon()
+                + (f"\nLocale: {locale}." if locale and locale != "en" else "")
+            ),
+        },
+        {"role": "user", "content": enrich_user},
+    ]
+
+    def _once(msgs) -> tuple[str | None, str | None]:
+        """Returns (text, finish_reason)."""
+        try:
+            resp = _llm_create(client,
+                model=model,
+                messages=msgs,
+                store=CHAT_OPENAI_STORE,
+                response_format={"type": "json_object"},
+                **openai_determinism_kw(),
+                **openai_advisory_max_tokens_kw(),
+            )
+        except Exception:
+            try:
+                resp = _llm_create(client,
+                    model=model,
+                    messages=msgs,
+                    store=CHAT_OPENAI_STORE,
+                    **openai_determinism_kw(),
+                    **openai_advisory_max_tokens_kw(),
+                )
+            except Exception:
+                return None, None
+        text = _chat_text(resp)
+        reason = None
+        try:
+            reason = resp.choices[0].finish_reason
+        except Exception:
+            pass
+        return text, reason
+
+    enrichment = None
+    raw, finish = _once(messages)
+    if raw:
+        enrichment = extract_json_object(raw)
+        if enrichment is None and finish == "length":
+            try:
+                from app.logger import logger as _log
+                _log.warning(
+                    "company_targeting enrichment truncated "
+                    "(finish_reason=length); using DB seed only"
+                )
+            except Exception:
+                pass
+            # Honest truncation signal for finalize / UI
+            seed["_truncated"] = True
+            seed["_truncation_reason"] = "finish_reason=length"
+        elif enrichment is None:
+            # one repair
+            repair = messages + [
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": (
+                    "JSON was invalid. Return a smaller valid JSON object "
+                    "with executive_summary, theses for the listed "
+                    "companies, and recommendations only."
+                )},
+            ]
+            raw2, _ = _once(repair)
+            if raw2:
+                enrichment = extract_json_object(raw2)
+
+    payload = merge_thesis_enrichment(seed, enrichment)
+    return repair_markdown_formatting(
+        render_company_targeting_markdown(payload)
+    )

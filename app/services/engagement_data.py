@@ -35,28 +35,106 @@ import psycopg2.extras
 
 from app.database import get_db
 
-# ─── Canonical "active licence" predicates (single source of truth) ──
-# These are hardcoded SQL fragments — safe to inline in f-strings because
-# they contain no user input. User-supplied values stay as %s bind params.
-ACTIVE_CLAUSE   = "lifecycle_status = 'Active'"
-# is-Licensed → the entity's ROLE marks it as a licensed company. The legacy
-# `licensed` boolean is unreliable (7,273 rows with role='Licensed Entity'
-# carry licensed=false) and the `is_rhq` boolean is entirely unpopulated in
-# the current data — so we key off role / registration_type instead.
-LICENSED_ENTITY  = "role = 'Licensed Entity'"
-ACTIVE_LICENSED  = f"{LICENSED_ENTITY} AND {ACTIVE_CLAUSE}"
-# is-RHQ for a LICENSED company → registration_type = 'RHQ'.
-ACTIVE_RHQ       = f"{LICENSED_ENTITY} AND registration_type = 'RHQ' AND {ACTIVE_CLAUSE}"
-# Non-licensed company → any entity that is not a Licensed Entity. Its country
-# is taken from country_profile_name (not shareholder nationality).
-NON_LICENSED     = "role IS DISTINCT FROM 'Licensed Entity'"
-# is-RHQ for a NON-LICENSED company → role = 'RHQ Entity'.
-NON_LICENSED_RHQ = "role = 'RHQ Entity'"
+# ─── Canonical "active licence" predicates ───────────────────────────
+# PLATFORM SOURCE OF TRUTH (all origins — not country-specific):
+#   company_profiles.licensed IS TRUE
+#   company_profiles.is_rhq IS TRUE
+# Confirmed live scale (national, not origin-filtered):
+#   SELECT COUNT(*) FROM company_profiles WHERE licensed = true;  -- ~95,671
+#   SELECT COUNT(*) FROM company_profiles WHERE is_rhq = true;    -- ~727
+# Never inflate with role-code ORs (ZLA/ZRHQ) — that produced the
+# false 96,283 / 1,645 totals. Legacy schemas without the booleans fall
+# back to role + lifecycle_status + registration_type ONLY when columns
+# are absent.
+#
+# Jul21-era PDFs that cited role+lifecycle origin totals (e.g. inflated
+# corridor figures) are NOT the SoR. Every origin corridor, footprint
+# inject, targeting seed, and prompt must use `_licensing_predicates`.
+
+LICENSING_SOR = "company_profiles.licensed / company_profiles.is_rhq"
+
+CANONICAL_LICENSED = "licensed IS TRUE"
+CANONICAL_RHQ = "is_rhq IS TRUE"
+
+ACTIVE_CLAUSE = "lifecycle_status = 'Active'"
+LICENSED_ENTITY = "role = 'Licensed Entity'"
+# Module-level aliases: prefer canonical booleans. Call sites that need
+# schema adaptation must use `_licensing_predicates(cur)`.
+ACTIVE_LICENSED = CANONICAL_LICENSED
+ACTIVE_RHQ = CANONICAL_RHQ
+NON_LICENSED = "licensed IS NOT TRUE"
+NON_LICENSED_RHQ = "is_rhq IS TRUE AND licensed IS NOT TRUE"
+
+# Legacy-only fragments (used when licensed/is_rhq columns are absent)
+_LEGACY_LICENSED = f"{LICENSED_ENTITY} AND {ACTIVE_CLAUSE}"
+_LEGACY_RHQ = (
+    f"{LICENSED_ENTITY} AND registration_type = 'RHQ' AND {ACTIVE_CLAUSE}"
+)
+
+
+def _column_exists(cur, table: str, column: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s "
+        "AND column_name = %s LIMIT 1",
+        (table, column),
+    )
+    return cur.fetchone() is not None
+
+
+def _licensing_predicates(cur, *, alias: str = "") -> dict[str, str]:
+    """Return SQL fragments for licensed / RHQ matching the connected schema.
+
+    Prefer the boolean columns `licensed` / `is_rhq` whenever present —
+    these are MISA's canonical markers for licence and RHQ counts.
+
+    `alias` — optional table alias prefix (e.g. 'cp') for JOIN queries.
+    """
+    p = f"{alias}." if alias else ""
+    has_lic = _column_exists(cur, "company_profiles", "licensed")
+    has_rhq = _column_exists(cur, "company_profiles", "is_rhq")
+    if has_lic and has_rhq:
+        return {
+            "licensed": f"{p}licensed IS TRUE",
+            "rhq": f"{p}is_rhq IS TRUE",
+            "non_licensed": f"{p}licensed IS NOT TRUE",
+            "non_licensed_rhq": (
+                f"{p}is_rhq IS TRUE AND {p}licensed IS NOT TRUE"
+            ),
+            "legacy": False,
+            "source": "company_profiles.licensed / company_profiles.is_rhq",
+        }
+    has_life = _column_exists(cur, "company_profiles", "lifecycle_status")
+    has_reg = _column_exists(cur, "company_profiles", "registration_type")
+    if has_life and has_reg:
+        return {
+            "licensed": (
+                f"{p}role = 'Licensed Entity' AND {p}lifecycle_status = 'Active'"
+            ),
+            "rhq": (
+                f"{p}role = 'Licensed Entity' AND {p}registration_type = 'RHQ' "
+                f"AND {p}lifecycle_status = 'Active'"
+            ),
+            "non_licensed": f"{p}role IS DISTINCT FROM 'Licensed Entity'",
+            "non_licensed_rhq": f"{p}role = 'RHQ Entity'",
+            "legacy": True,
+            "source": (
+                "company_profiles.role + lifecycle_status + registration_type"
+            ),
+        }
+    # Last-resort role codes only when booleans and legacy cols are absent.
+    return {
+        "licensed": f"{p}role IN ('Licensed Entity', 'ZLA')",
+        "rhq": f"{p}role IN ('ZRHQ', 'RHQ Entity')",
+        "non_licensed": f"{p}role IS DISTINCT FROM 'Licensed Entity'",
+        "non_licensed_rhq": f"{p}role = 'ZRHQ'",
+        "legacy": False,
+        "source": "company_profiles.role (fallback)",
+    }
+
 
 def _resolve_iso_codes(cur, cn: str) -> list[str]:
-    """ISO alpha-2 code(s) for a country, read from country_profiles.
-    Used to also match shareholder_country_code — the JSON array of
-    codes that runs parallel to shareholder_country_name."""
+    """ISO alpha-2 code(s) for a country, read from country_profiles."""
     try:
         cur.execute(
             "SELECT DISTINCT UPPER(TRIM(country_code)) AS cc "
@@ -65,40 +143,103 @@ def _resolve_iso_codes(cur, cn: str) -> list[str]:
             "AND (country_name ILIKE %s OR country_name ILIKE %s)",
             (cn, f"%{cn}%"),
         )
-        return [r["cc"] for r in cur.fetchall() if r.get("cc")]
+        rows = cur.fetchall()
+        codes = []
+        for r in rows:
+            if isinstance(r, dict):
+                cc = r.get("cc")
+            else:
+                cc = r[0]
+            if cc:
+                codes.append(str(cc).upper())
+        return codes
     except Exception:
         return []
 
 
 def _build_origin_filter(cur, cn: str) -> tuple[str, tuple]:
-    """SQL predicate matching a LICENSED company's shareholder NATIONALITY
-    on BOTH columns, using the SAME exact-name logic for every country
-    (no per-country alias list):
-      • shareholder_country_name  (exact country name, ILIKE '%<name>%')
-      • shareholder_country_code  (ISO alpha-2 code, resolved dynamically
-        from country_profiles — this is what safely catches spelling
-        variants like 'USA' without hardcoding them)
-    Returns (sql_fragment, params) — params bind positionally in order."""
-    patterns = (f"%{cn}%",)
-    name_cond = "sc ILIKE %s"
-    codes = _resolve_iso_codes(cur, cn)
-    if codes:
-        code_cond = " OR ".join(["UPPER(scc) = %s"] * len(codes))
-        code_exists = (
-            " OR EXISTS (SELECT 1 FROM "
-            "jsonb_array_elements_text(shareholder_country_code::jsonb) AS scc "
-            f"WHERE {code_cond})"
+    """SQL predicate matching a company's origin / shareholder nationality.
+
+    Legacy: shareholder_country_name / shareholder_country_code JSONB on
+    company_profiles.
+    Live: ir_shareholders.shareholder_country (ISO) → contracts.c4c_id →
+    company_profiles.entity_id, plus bus_data.nationality when present.
+    """
+    cn = (cn or "").strip()
+    if _column_exists(cur, "company_profiles", "shareholder_country_name"):
+        patterns = (f"%{cn}%",)
+        name_cond = "sc ILIKE %s"
+        codes = _resolve_iso_codes(cur, cn)
+        if codes:
+            code_cond = " OR ".join(["UPPER(scc) = %s"] * len(codes))
+            code_exists = (
+                " OR EXISTS (SELECT 1 FROM "
+                "jsonb_array_elements_text(shareholder_country_code::jsonb) "
+                f"AS scc WHERE {code_cond})"
+            )
+            params = patterns + tuple(codes)
+        else:
+            code_exists = ""
+            params = patterns
+        sql = (
+            "(EXISTS (SELECT 1 FROM "
+            "jsonb_array_elements_text(shareholder_country_name::jsonb) AS sc "
+            f"WHERE {name_cond}){code_exists})"
         )
-        params = patterns + tuple(codes)
-    else:
-        code_exists = ""
-        params = patterns
-    sql = (
-        "(EXISTS (SELECT 1 FROM "
-        "jsonb_array_elements_text(shareholder_country_name::jsonb) AS sc "
-        f"WHERE {name_cond}){code_exists})"
-    )
-    return sql, params
+        return sql, params
+
+    # Live schema path
+    codes = _resolve_iso_codes(cur, cn)
+    parts: list[str] = []
+    params: list = []
+    if codes and _column_exists(cur, "ir_shareholders", "shareholder_country"):
+        parts.append(
+            "EXISTS ("
+            "SELECT 1 FROM ir_shareholders s "
+            "JOIN contracts ct ON ct.contract_id::text = s.contract_id::text "
+            "WHERE company_profiles.entity_id::text = ct.c4c_id::text "
+            "AND UPPER(TRIM(s.shareholder_country)) = ANY(%s)"
+            ")"
+        )
+        params.append(codes)
+    if _column_exists(cur, "bus_data", "nationality"):
+        parts.append(
+            "EXISTS ("
+            "SELECT 1 FROM bus_data b "
+            "WHERE TRIM(b.misa_entity_id) = TRIM(company_profiles.entity_id::text) "
+            "AND b.nationality ILIKE %s"
+            ")"
+        )
+        params.append(cn)
+    # HQ-country fallback (weaker — parent sitting in origin country).
+    if _column_exists(cur, "company_profiles", "country_id") and _column_exists(
+        cur, "countries", "name"
+    ):
+        parts.append(
+            "EXISTS ("
+            "SELECT 1 FROM countries c "
+            "WHERE c.id = company_profiles.country_id AND c.name ILIKE %s"
+            ")"
+        )
+        params.append(cn)
+
+    if not parts:
+        # Last resort — never match silently as "everything".
+        return ("FALSE", tuple())
+    return "(" + " OR ".join(parts) + ")", tuple(params)
+
+
+def _hq_country_filter(cur, cn: str) -> tuple[str, tuple]:
+    """Match companies whose HQ country_profile / countries row is cn."""
+    if _column_exists(cur, "company_profiles", "country_profile_name"):
+        return "country_profile_name ILIKE %s", (f"%{cn}%",)
+    if _column_exists(cur, "company_profiles", "country_id"):
+        return (
+            "EXISTS (SELECT 1 FROM countries c "
+            "WHERE c.id = company_profiles.country_id AND c.name ILIKE %s)",
+            (cn,),
+        )
+    return "FALSE", tuple()
 
 
 # ─── Shared helpers ─────────────────────────────────────────────────
@@ -446,39 +587,17 @@ def has_any_engagement_data(data: dict) -> bool:
 # ─── country_profile: companies from a country investing in Saudi ──
 
 def fetch_country_saudi_investors(country_name: str) -> dict:
-    """List companies from a given HQ country with a presence in Saudi
-    Arabia (licensed and/or RHQ).
+    """List companies from a given origin nationality with Saudi presence
+    (licensed and/or RHQ).
 
-    CANONICAL SOURCE: `company_profiles`. Licensing/RHQ status is
-    derived from role / registration_type (NOT the legacy `licensed`
-    / `is_rhq` booleans, which are unreliable / unpopulated):
+    Origin matching is schema-adaptive (see `_build_origin_filter`).
+    Licensing/RHQ predicates are schema-adaptive (see
+    `_licensing_predicates`).
 
-      • Licensed company   → role = 'Licensed Entity'
-      • Licensed RHQ       → role = 'Licensed Entity'
-                             AND registration_type = 'RHQ'
-      • Non-licensed       → role <> 'Licensed Entity'
-      • Non-licensed RHQ   → role = 'RHQ Entity'
-
-    Country attribution differs by group:
-      • Licensed     → nationality of shareholders (shareholder_country_name)
-      • Non-licensed → country_profile_name / country_profile_id
-
-    Returns a dict:
-      {
-        'rhq': [...]           # licensed RHQ rows (registration_type='RHQ')
-        'licensed_only': [...] # licensed, non-RHQ rows
-        'non_licensed': [...]  # non-licensed rows (country_profile_name match)
-        'total_rhq': int,              # licensed RHQ count
-        'total_licensed': int,         # licensed count
-        'total_non_licensed': int,     # non-licensed count
-        'total_non_licensed_rhq': int, # non-licensed RHQ (role='RHQ Entity')
-      }
-    Licensed lists are ordered by annual_revenue DESC, capped at 15 rows;
-    the non-licensed list at 10, so the curation prompt stays bounded.
+    Returns a dict with rhq / licensed_only / non_licensed lists and
+    totals. On DB/schema failure sets `_db_error` — callers MUST treat
+    that as "data unavailable", never as real zeros.
     """
-    # _db_error is set to a message string when the DB is unreachable.
-    # Callers MUST check this key — a missing key means the query ran
-    # cleanly; zeros are real zeros, not "DB down".
     out: dict = {
         "rhq": [], "licensed_only": [], "non_licensed": [],
         "total_rhq": 0, "total_licensed": 0,
@@ -491,110 +610,216 @@ def fetch_country_saudi_investors(country_name: str) -> dict:
     try:
         conn = get_db()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Licensed nationality matches BOTH shareholder_country_name
-            # (spellings) AND shareholder_country_code (ISO alpha-2).
+            preds = _licensing_predicates(cur)
+            lic_sql = preds["licensed"]
+            rhq_sql = preds["rhq"]
+            non_lic_sql = preds["non_licensed"]
+            non_rhq_sql = preds["non_licensed_rhq"]
+
             _origin_filter, _origin_params = _build_origin_filter(cur, cn)
+            if _origin_filter == "FALSE":
+                out["_db_error"] = (
+                    f"no origin-matching path for country={cn!r} "
+                    "on this schema"
+                )
+                out["retrieval_status"] = "SOURCE_UNAVAILABLE"
+                out["retrieval"] = {
+                    "retrieval_status": "SOURCE_UNAVAILABLE",
+                    "source_name": "company_profiles",
+                    "counts_unavailable": True,
+                    "do_not_claim_zero": True,
+                    "filters": {"origin_country": cn},
+                }
+                return out
 
             cur.execute(
                 f"SELECT COUNT(*) c FROM company_profiles "
-                f"WHERE {_origin_filter} AND {ACTIVE_LICENSED}",
+                f"WHERE {_origin_filter} AND {lic_sql}",
                 _origin_params,
             )
             out["total_licensed"] = int(cur.fetchone()["c"])
             cur.execute(
                 f"SELECT COUNT(*) c FROM company_profiles "
-                f"WHERE {_origin_filter} AND {ACTIVE_RHQ}",
+                f"WHERE {_origin_filter} AND {rhq_sql}",
                 _origin_params,
             )
             out["total_rhq"] = int(cur.fetchone()["c"])
 
+            select_cols = (
+                "id, company_name, headquarters, "
+                "annual_revenue, employee_count, "
+                "industry, founded, ceo, role"
+            )
+            if not preds.get("legacy"):
+                if _column_exists(cur, "company_profiles", "licensed"):
+                    select_cols += ", licensed"
+                if _column_exists(cur, "company_profiles", "is_rhq"):
+                    select_cols += ", is_rhq"
+            else:
+                select_cols += ", registration_type"
+
             cur.execute(f"""
-                SELECT id, company_name, headquarters,
-                       annual_revenue, employee_count,
-                       industry, founded, ceo,
-                       role, registration_type
+                SELECT {select_cols}
                 FROM company_profiles
                 WHERE {_origin_filter}
-                  AND {ACTIVE_RHQ}
+                  AND {rhq_sql}
                 ORDER BY annual_revenue DESC NULLS LAST
                 LIMIT 15
             """, _origin_params)
             out["rhq"] = [dict(r) for r in cur.fetchall()]
 
             cur.execute(f"""
-                SELECT id, company_name, headquarters,
-                       annual_revenue, employee_count,
-                       industry, founded, ceo,
-                       role, registration_type
+                SELECT {select_cols}
                 FROM company_profiles
                 WHERE {_origin_filter}
-                  AND {ACTIVE_LICENSED}
-                  AND registration_type IS DISTINCT FROM 'RHQ'
+                  AND {lic_sql}
+                  AND NOT ({rhq_sql})
                 ORDER BY annual_revenue DESC NULLS LAST
                 LIMIT 15
             """, _origin_params)
             out["licensed_only"] = [dict(r) for r in cur.fetchall()]
 
-            # Non-licensed companies — keyed by country_profile_name (plain
-            # varchar / country_profile_id), NOT shareholder nationality.
-            # "Non-licensed" = any entity whose role is not 'Licensed Entity'.
+            hq_filter, hq_params = _hq_country_filter(cur, cn)
             cur.execute(
                 f"SELECT COUNT(*) c FROM company_profiles "
-                f"WHERE country_profile_name ILIKE %s AND {NON_LICENSED}",
-                (f"%{cn}%",),
+                f"WHERE {hq_filter} AND {non_lic_sql}",
+                hq_params,
             )
             out["total_non_licensed"] = int(cur.fetchone()["c"])
 
-            # is-RHQ for a non-licensed company → role = 'RHQ Entity'.
             cur.execute(
                 f"SELECT COUNT(*) c FROM company_profiles "
-                f"WHERE country_profile_name ILIKE %s AND {NON_LICENSED_RHQ}",
-                (f"%{cn}%",),
+                f"WHERE {hq_filter} AND {non_rhq_sql}",
+                hq_params,
             )
             out["total_non_licensed_rhq"] = int(cur.fetchone()["c"])
 
             cur.execute(f"""
                 SELECT id, company_name, headquarters, annual_revenue,
-                       employee_count, industry, founded, ceo,
-                       role, registration_type, country_profile_name
+                       employee_count, industry, founded, ceo, role
                 FROM company_profiles
-                WHERE country_profile_name ILIKE %s AND {NON_LICENSED}
+                WHERE {hq_filter} AND {non_lic_sql}
                 ORDER BY annual_revenue DESC NULLS LAST LIMIT 10
-            """, (f"%{cn}%",))
+            """, hq_params)
             out["non_licensed"] = [dict(r) for r in cur.fetchall()]
     except Exception as exc:
         out["_db_error"] = str(exc)
+        # Keep totals at 0 but always signal error — never "real zero".
+        out["rhq"] = []
+        out["licensed_only"] = []
+        out["non_licensed"] = []
+        try:
+            from app.services.retrieval_status import (
+                classify_exception, failure,
+            )
+            rr = failure(
+                classify_exception(exc),
+                source_name="company_profiles",
+                error=str(exc),
+                filters={"origin_country": cn},
+            )
+            out["retrieval_status"] = rr.status.value
+            out["retrieval"] = rr.to_context_dict()
+        except Exception:
+            out["retrieval_status"] = "UNKNOWN_ERROR"
+            out["retrieval"] = {
+                "counts_unavailable": True,
+                "do_not_claim_zero": True,
+            }
+        return out
+
+    try:
+        from app.services.retrieval_status import (
+            RetrievalStatus, success_counts,
+        )
+        n = int(out.get("total_licensed") or 0) + int(out.get("total_rhq") or 0)
+        rr = success_counts(
+            source_name="company_profiles.licensed/is_rhq",
+            count=n,
+            filters={"origin_country": cn},
+            query="COUNT where licensed/is_rhq + origin filter",
+            metadata={
+                "total_licensed": out.get("total_licensed"),
+                "total_rhq": out.get("total_rhq"),
+            },
+        )
+        if n == 0:
+            rr.status = RetrievalStatus.SUCCESS_EMPTY
+        out["retrieval_status"] = rr.status.value
+        out["retrieval"] = rr.to_context_dict()
+    except Exception:
+        out["retrieval_status"] = (
+            "SUCCESS_EMPTY"
+            if int(out.get("total_licensed") or 0) == 0
+            and int(out.get("total_rhq") or 0) == 0
+            else "SUCCESS_WITH_RESULTS"
+        )
     return out
 
 
-def fetch_country_sector_distribution(country_name: str) -> list[dict]:
-    """Sector breakdown of the licensed companies from a given HQ
-    country — the DB evidence for 'which sectors convert'. Returns
-    [{industry, licensed_count, rhq_count}, ...] ordered by licensed
-    volume, capped at 12 sectors."""
+def fetch_country_sector_distribution(country_name: str) -> dict:
+    """Sector breakdown of the licensed companies from a given origin
+    country — the DB evidence for 'which sectors convert'.
+
+    Returns ``{"sectors": [...], "_db_error": None|str, ...}``.
+    Empty ``sectors`` with no ``_db_error`` means a successful empty
+    result; ``_db_error`` set means counts are unavailable (never
+    interpret as 'no sectors').
+    """
+    out: dict = {
+        "sectors": [],
+        "_db_error": None,
+        "retrieval_status": None,
+    }
     if not country_name:
-        return []
+        return out
     cn = country_name.strip()
     try:
         conn = get_db()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Same both-column nationality match as fetch_country_saudi_investors.
+            preds = _licensing_predicates(cur)
             _origin_filter, _origin_params = _build_origin_filter(cur, cn)
+            if _origin_filter == "FALSE":
+                out["retrieval_status"] = "SUCCESS_EMPTY"
+                return out
             cur.execute(f"""
                 SELECT COALESCE(NULLIF(TRIM(industry), ''), 'Unclassified')
                            AS industry,
                        COUNT(*) AS licensed_count,
-                       COUNT(*) FILTER (WHERE {ACTIVE_RHQ}) AS rhq_count
+                       COUNT(*) FILTER (WHERE {preds['rhq']}) AS rhq_count
                 FROM company_profiles
                 WHERE {_origin_filter}
-                  AND {ACTIVE_LICENSED}
+                  AND {preds['licensed']}
                 GROUP BY 1
                 ORDER BY licensed_count DESC
                 LIMIT 12
             """, _origin_params)
-            return [dict(r) for r in cur.fetchall()]
-    except Exception:
-        return []
+            out["sectors"] = [dict(r) for r in cur.fetchall()]
+            out["retrieval_status"] = (
+                "SUCCESS" if out["sectors"] else "SUCCESS_EMPTY"
+            )
+            return out
+    except Exception as exc:
+        out["_db_error"] = str(exc)
+        out["retrieval_status"] = "SOURCE_UNAVAILABLE"
+        try:
+            from app.services.retrieval_status import (
+                classify_exception, failure,
+            )
+            rr = failure(
+                classify_exception(exc),
+                source_name="company_profiles.sector_distribution",
+                error=str(exc),
+                filters={"origin_country": cn},
+            )
+            out["retrieval"] = rr.to_context_dict()
+            out["retrieval_status"] = rr.status.value
+        except Exception:
+            out["retrieval"] = {
+                "counts_unavailable": True,
+                "do_not_claim_zero": True,
+            }
+        return out
 
 
 def fetch_country_profile_bundle(country_name: str) -> dict:
@@ -643,51 +868,196 @@ def fetch_country_profile_bundle(country_name: str) -> dict:
 # ─── Saudi licensing aggregate (for "how many RHQ / licensed?") ────
 
 def fetch_saudi_licensing_summary() -> dict:
-    """Aggregate totals + breakdown for the canonical Saudi-licensing
-    counts on company_profiles. Powers the dedicated path that
-    answers "how many RHQ licences do we have?" / "how many licensed
-    companies in Saudi?" with executive-grade context, not a raw
-    SELECT COUNT(*) on the auxiliary rhq_licenses table (only 661
-    rows vs the canonical 727 RHQ / 95k+ licensed)."""
+    """Aggregate totals + breakdown for Saudi-licensing counts.
+
+    Totals always use canonical `licensed` / `is_rhq` when present.
+    Country breakdown prefers shareholder nationality (origin), not HQ
+    city — HQ country_id is often Saudi for every RHQ and misleads.
+
+    On any exception returns ``_db_error`` / ``do_not_claim_zero`` —
+    never a silent zero census.
+    """
     out = {
         "total_licensed": 0,
         "total_rhq": 0,
-        "rhq_by_country": [],     # [{country, n}] top 10
-        "licensed_by_country": [], # [{country, n}] top 10
+        "rhq_by_country": [],
+        "licensed_by_country": [],
+        "predicate_source": "",
     }
+    try:
+        return _fetch_saudi_licensing_summary_inner(out)
+    except Exception as exc:
+        out["_db_error"] = str(exc)
+        out["counts_unavailable"] = True
+        out["do_not_claim_zero"] = True
+        out["footprint_data_unavailable"] = True
+        try:
+            from app.services.retrieval_status import (
+                classify_exception, failure,
+            )
+            rr = failure(
+                classify_exception(exc),
+                source_name="company_profiles.licensed/is_rhq",
+                error=str(exc),
+            )
+            out["retrieval_status"] = rr.status.value
+            out["retrieval"] = rr.to_context_dict()
+        except Exception:
+            out["retrieval_status"] = "UNKNOWN_ERROR"
+            out["retrieval"] = {
+                "counts_unavailable": True,
+                "do_not_claim_zero": True,
+            }
+        return out
+
+
+def _fetch_saudi_licensing_summary_inner(out: dict) -> dict:
     conn = get_db()
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        preds = _licensing_predicates(cur)
+        out["predicate_source"] = preds.get("source") or ""
         cur.execute(
-            f"SELECT COUNT(*) c FROM company_profiles WHERE {ACTIVE_LICENSED}"
+            f"SELECT COUNT(*) c FROM company_profiles WHERE {preds['licensed']}"
         )
         out["total_licensed"] = int(cur.fetchone()["c"])
         cur.execute(
-            f"SELECT COUNT(*) c FROM company_profiles WHERE {ACTIVE_RHQ}"
+            f"SELECT COUNT(*) c FROM company_profiles WHERE {preds['rhq']}"
         )
         out["total_rhq"] = int(cur.fetchone()["c"])
 
-        # Top origin countries for RHQ companies via shareholder_country_name JSONB.
-        cur.execute(f"""
-            SELECT sc AS country, COUNT(*) AS n
-            FROM company_profiles,
-                 jsonb_array_elements_text(shareholder_country_name::jsonb) AS sc
-            WHERE {ACTIVE_RHQ}
-            GROUP BY 1
-            ORDER BY n DESC LIMIT 12
-        """)
-        out["rhq_by_country"] = [dict(r) for r in cur.fetchall()]
+        if _column_exists(cur, "company_profiles", "shareholder_country_name"):
+            cur.execute(f"""
+                SELECT sc AS country, COUNT(*) AS n
+                FROM company_profiles,
+                     jsonb_array_elements_text(shareholder_country_name::jsonb) AS sc
+                WHERE {preds['rhq']}
+                GROUP BY 1
+                ORDER BY n DESC LIMIT 12
+            """)
+            out["rhq_by_country"] = [dict(r) for r in cur.fetchall()]
+            cur.execute(f"""
+                SELECT sc AS country, COUNT(*) AS n
+                FROM company_profiles,
+                     jsonb_array_elements_text(shareholder_country_name::jsonb) AS sc
+                WHERE {preds['licensed']}
+                GROUP BY 1
+                ORDER BY n DESC LIMIT 12
+            """)
+            out["licensed_by_country"] = [dict(r) for r in cur.fetchall()]
+        elif _column_exists(cur, "bus_data", "nationality") or (
+            _column_exists(cur, "ir_shareholders", "shareholder_country")
+            and _column_exists(cur, "contracts", "c4c_id")
+        ):
+            # Live: attribute each company to an origin nationality.
+            # Prefer bus_data.nationality (best RHQ coverage); fall back
+            # to ir_shareholders ISO → country_profiles name.
+            has_bus = _column_exists(cur, "bus_data", "nationality")
+            has_share = (
+                _column_exists(cur, "ir_shareholders", "shareholder_country")
+                and _column_exists(cur, "contracts", "c4c_id")
+            )
+            has_cpn = _column_exists(cur, "country_profiles", "country_code")
+            origin_parts: list[str] = []
+            if has_bus:
+                origin_parts.append(
+                    "(SELECT NULLIF(TRIM(b.nationality), '') "
+                    "FROM bus_data b "
+                    "WHERE TRIM(b.misa_entity_id) = TRIM(cp.entity_id::text) "
+                    "AND b.nationality IS NOT NULL LIMIT 1)"
+                )
+            if has_share:
+                share_sel = (
+                    "COALESCE(cpn.country_name, s.shareholder_country)"
+                    if has_cpn else "s.shareholder_country"
+                )
+                share_join = (
+                    "LEFT JOIN country_profiles cpn ON "
+                    "UPPER(TRIM(cpn.country_code)) = "
+                    "UPPER(TRIM(s.shareholder_country)) "
+                    if has_cpn else ""
+                )
+                origin_parts.append(
+                    "(SELECT " + share_sel + " "
+                    "FROM contracts ct "
+                    "JOIN ir_shareholders s "
+                    "ON s.contract_id::text = ct.contract_id::text "
+                    + share_join +
+                    "WHERE ct.c4c_id::text = cp.entity_id::text "
+                    "AND s.shareholder_country IS NOT NULL "
+                    "AND TRIM(s.shareholder_country) <> '' "
+                    "LIMIT 1)"
+                )
+            origin_expr = (
+                "COALESCE(" + ", ".join(origin_parts)
+                + ", 'Other / Unspecified')"
+                if origin_parts else "'Other / Unspecified'"
+            )
+            preds_cp = _licensing_predicates(cur, alias="cp")
+            # RHQ breakdown only (~727 rows — correlated origin is fine)
+            cur.execute(f"""
+                SELECT country, COUNT(*) AS n FROM (
+                    SELECT cp.id, {origin_expr} AS country
+                    FROM company_profiles cp
+                    WHERE {preds_cp['rhq']}
+                ) attributed
+                GROUP BY country
+                ORDER BY n DESC
+                LIMIT 12
+            """)
+            out["rhq_by_country"] = [dict(r) for r in cur.fetchall()]
 
-        # Top origin countries for ALL licensed companies (incl RHQ).
-        cur.execute(f"""
-            SELECT sc AS country, COUNT(*) AS n
-            FROM company_profiles,
-                 jsonb_array_elements_text(shareholder_country_name::jsonb) AS sc
-            WHERE {ACTIVE_LICENSED}
-            GROUP BY 1
-            ORDER BY n DESC LIMIT 12
-        """)
-        out["licensed_by_country"] = [dict(r) for r in cur.fetchall()]
+            # Licensed breakdown — cheap LEFT JOIN on bus_data only
+            if has_bus:
+                cur.execute(f"""
+                    SELECT COALESCE(NULLIF(TRIM(b.nationality), ''),
+                                    'Other / Unspecified') AS country,
+                           COUNT(DISTINCT cp.id) AS n
+                    FROM company_profiles cp
+                    LEFT JOIN bus_data b
+                      ON TRIM(b.misa_entity_id) = TRIM(cp.entity_id::text)
+                    WHERE {preds_cp['licensed']}
+                    GROUP BY 1
+                    ORDER BY n DESC
+                    LIMIT 12
+                """)
+                out["licensed_by_country"] = [dict(r) for r in cur.fetchall()]
+        elif _column_exists(cur, "countries", "name"):
+            preds_cp = _licensing_predicates(cur, alias="cp")
+            cur.execute(f"""
+                SELECT c.name AS country, COUNT(*) AS n
+                FROM company_profiles cp
+                JOIN countries c ON c.id = cp.country_id
+                WHERE {preds_cp['rhq']}
+                GROUP BY 1
+                ORDER BY n DESC LIMIT 12
+            """)
+            out["rhq_by_country"] = [dict(r) for r in cur.fetchall()]
+            cur.execute(f"""
+                SELECT c.name AS country, COUNT(*) AS n
+                FROM company_profiles cp
+                JOIN countries c ON c.id = cp.country_id
+                WHERE {preds_cp['licensed']}
+                GROUP BY 1
+                ORDER BY n DESC LIMIT 12
+            """)
+            out["licensed_by_country"] = [dict(r) for r in cur.fetchall()]
+    try:
+        from app.services.retrieval_status import success_counts
+        rr = success_counts(
+            source_name="company_profiles.licensed/is_rhq",
+            count=int(out.get("total_licensed") or 0),
+            filters={"predicate": out.get("predicate_source")},
+            metadata={
+                "total_licensed": out.get("total_licensed"),
+                "total_rhq": out.get("total_rhq"),
+            },
+        )
+        out["retrieval_status"] = rr.status.value
+        out["retrieval"] = rr.to_context_dict()
+    except Exception:
+        out["retrieval_status"] = "SUCCESS_WITH_RESULTS"
     return out
+
 
 
 def has_any_saudi_investors(bundle: dict) -> bool:

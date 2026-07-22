@@ -62,39 +62,63 @@ def is_configured() -> bool:
 
 
 def search(query: str, max_results: int = 5) -> list[dict]:
-    """Run an OpenAI-backed web search for `query`. Returns a list of
-    result dicts with the same shape we've always used:
+    """Back-compat list API. Prefer ``search_with_status`` when the
+    caller must distinguish SOURCE_UNAVAILABLE from verified empty.
+    """
+    return list(search_with_status(query, max_results=max_results).get("results") or [])
 
-      [
-        {"title": "...", "url": "https://...", "snippet": "...",
-         "published": "", "score": 0.0},
-        ...
-      ]
 
-    Returns `[]` (NOT None) when:
-      - query is empty
-      - OpenAI client is unavailable
-      - the search call fails (the search-preview model isn't enabled
-        on this account, rate-limited, network error, etc.)
-      - the model returns no citations
+def search_with_status(query: str, max_results: int = 5) -> dict:
+    """Web search with retrieval-status envelope.
 
-    The deep-profile curator treats an empty result list as a signal
-    to mark its strategic-analysis bullets as `[inferred]` rather
-    than `[web]`, so downstream UX never falsely claims grounding.
+    Empty ``results`` + ``do_not_claim_zero`` means failure/unavailable,
+    not a verified empty web census.
     """
     q = (query or "").strip()
     if not q:
-        return []
+        return {
+            "results": [],
+            "retrieval_status": "SUCCESS_EMPTY",
+            "do_not_claim_zero": False,
+            "source_name": "web_search",
+            "error": None,
+            "verified_empty": True,
+            "record_count": 0,
+        }
     client = get_public_openai_client()
     if client is None:
-        return []
+        return {
+            "results": [],
+            "retrieval_status": "SOURCE_UNAVAILABLE",
+            "do_not_claim_zero": True,
+            "counts_unavailable": True,
+            "source_name": "web_search",
+            "error": "OpenAI public search client not configured",
+            "record_count": 0,
+        }
     try:
-        return _openai_search(client, q, max_results)
-    except Exception:
-        # Silent fail — never break a turn over web search. If the
-        # search-preview model isn't enabled on the user's OpenAI
-        # account, this is exactly the path we want.
-        return []
+        rows = _openai_search(client, q, max_results)
+        return {
+            "results": rows,
+            "retrieval_status": (
+                "SUCCESS_WITH_RESULTS" if rows else "SUCCESS_EMPTY"
+            ),
+            "do_not_claim_zero": False,
+            "source_name": "web_search",
+            "error": None,
+            "verified_empty": not bool(rows),
+            "record_count": len(rows or []),
+        }
+    except Exception as exc:
+        return {
+            "results": [],
+            "retrieval_status": "SOURCE_UNAVAILABLE",
+            "do_not_claim_zero": True,
+            "counts_unavailable": True,
+            "source_name": "web_search",
+            "error": str(exc)[:400],
+            "record_count": 0,
+        }
 
 
 def _openai_search(client, query: str, max_results: int) -> list[dict]:

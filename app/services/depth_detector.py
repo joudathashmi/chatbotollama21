@@ -182,7 +182,8 @@ _DEPTH_NOTE = {
     ),
     "executive_briefing": (
         "DEPTH: executive_briefing — the user wants a FULL ministerial\n"
-        "briefing. Render all 10 sections (only skip a section when\n"
+        "briefing at Jul21 narrative depth (typically 800–1,500 words).\n"
+        "Render all 10 sections (only skip a section when\n"
         "the data is genuinely absent — say so per the missing-data\n"
         "transparency rule):\n"
         "  1. Executive Summary — 2-3 sentence BLUF\n"
@@ -196,7 +197,10 @@ _DEPTH_NOTE = {
         "  8. Engagement Opportunities — recommended approach, sectors\n"
         "  9. Risks / Watch Items — succession, regulatory, market\n"
         " 10. Recommended Actions — concrete next-best actions\n"
-        "Bullets dense but no padding. Bold the critical numbers.\n"
+        "Every Strategic / Engagement / Recommended Actions bullet must\n"
+        "name a concrete anchor (programme, giga-project, agency, or\n"
+        "counterpart). Bullets dense but no padding. Bold the critical\n"
+        "numbers. Never paste another country's IPA into the brief.\n"
     ),
     "strategic_recommendation": (
         "DEPTH: strategic_recommendation — the user wants ACTIONABLE\n"

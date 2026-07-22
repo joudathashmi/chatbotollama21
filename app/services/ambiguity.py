@@ -145,9 +145,24 @@ def discover_candidates(entity: str) -> list[dict]:
     e = entity.strip().lower()
 
     try:
-        df, _, _ = run_rhq_company_smart_search([entity], DISCOVERY_LIMIT)
-    except Exception:
-        return []
+        df, sql, _ = run_rhq_company_smart_search([entity], DISCOVERY_LIMIT)
+        from app.database import smart_search_retrieval_failed
+        if smart_search_retrieval_failed(sql):
+            # Outage ≠ no candidates. Surface sentinel so callers can
+            # show "search unavailable" instead of a false clarification.
+            return [{
+                "_retrieval_failed": True,
+                "name": "",
+                "score": 0.0,
+                "error": sql,
+            }]
+    except Exception as exc:
+        return [{
+            "_retrieval_failed": True,
+            "name": "",
+            "score": 0.0,
+            "error": str(exc),
+        }]
     if df is None or df.empty:
         return []
 
@@ -198,7 +213,14 @@ def detect_ambiguity(entity: str, candidates: list[dict]) -> Optional[list[dict]
     """
     if not candidates or len(candidates) < 2:
         return None
+    if any(c.get("_retrieval_failed") for c in candidates):
+        return None  # outage — do not ask clarification on empty/noise
     if not entity:
+        return None
+
+    # Drop any sentinel failure rows before scoring
+    candidates = [c for c in candidates if not c.get("_retrieval_failed") and c.get("name")]
+    if len(candidates) < 2:
         return None
 
     e_norm = normalise_company_name(entity)

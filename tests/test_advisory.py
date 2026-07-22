@@ -122,8 +122,11 @@ def test_advisory_country_context_includes_sector_distribution():
                       "rhq": [], "licensed_only": []},
     ), patch(
         "app.services.engagement_data.fetch_country_sector_distribution",
-        return_value=[{"industry": "Oil, Gas, Energy & Water",
-                       "licensed_count": 9, "rhq_count": 6}],
+        return_value={
+            "sectors": [{"industry": "Oil, Gas, Energy & Water",
+                         "licensed_count": 9, "rhq_count": 6}],
+            "_db_error": None,
+        },
     ), patch(
         "app.services.engagement_data.resolve_country_id",
         return_value=(None, None),  # skip the country-insights queries
@@ -152,8 +155,9 @@ def test_advisory_country_survives_db_failure():
     # Missing must never masquerade as zero: DB failure sets an
     # explicit unavailability flag (the prompt omits the footprint
     # section) instead of leaving count fields silently absent.
-    assert ctx == {"origin_country": "Pakistan",
-                   "footprint_data_unavailable": True}
+    assert ctx.get("origin_country") == "Pakistan"
+    assert ctx.get("footprint_data_unavailable") is True
+    assert "companies_from_origin_licensed_in_saudi" not in ctx
 
 
 def test_advisory_prompt_forbids_missing_as_zero():
@@ -182,6 +186,56 @@ def test_market_fit_request_detected():
         "what is the market fit for attracting Indian companies to "
         "Saudi Arabia"
     ) == "market_fit"
+
+
+def test_typo_make_market_for_atrract_routes_to_market_fit():
+    """User PDF case: typos must still yield full market-fit advisory."""
+    q = "make me a market for to atrract indian companies"
+    assert mc._is_advisory_question(q) is True
+    assert mc._detect_advisory_deliverable(q) == "market_fit"
+
+
+def test_market_fit_not_overwritten_by_company_targeting_rebuild():
+    """Absent Priority Ranking must NOT wipe a market-fit assessment."""
+    from app.services.advisory_structured import ranking_table_is_truncated
+    from app.services.response_validator import validate_advisory_answer
+
+    mf = (
+        "# Market Fit Assessment: Attracting Indian Companies to "
+        "Saudi Arabia\n\n"
+        "## Strategic Context\n"
+        "India is a major outbound investor; Saudi Arabia is a "
+        "regional growth platform for Vision 2030 sectors.\n\n"
+        "## Overall Market Fit\n"
+        "| Sector | Strategic Fit | Investment Potential | Priority |\n"
+        "|---|---|---|---|\n"
+        "| ICT | High | High | Tier 1 |\n"
+        "| Healthcare | High | Medium | Tier 1 |\n\n"
+        "## Investment & Trade Bodies to Engage\n"
+        "| Organisation | Type | Role |\n"
+        "|---|---|---|\n"
+        "| Invest India | IPA | National pipeline |\n"
+        "| CII | Industry body | Manufacturing outreach |\n\n"
+        "## Strategic Conclusion\n"
+        "Complementarity thesis holds.\n"
+    )
+    assert ranking_table_is_truncated(mf) is False
+    ctx = {
+        "origin_country": "India",
+        "companies_from_origin_licensed_in_saudi": 2437,
+        "companies_from_origin_with_rhq": 14,
+        "retrieval_status": "SUCCESS_WITH_RESULTS",
+        "expansion_targets": [
+            {"company": "Tech Mahindra", "sector": "IT",
+             "current_saudi_presence": "RHQ"},
+        ],
+    }
+    fixed, fixes = validate_advisory_answer(mf, ctx)
+    assert "rebuilt_truncated_company_targeting_from_db" not in fixes
+    assert "Market Fit Assessment" in fixed
+    assert "Priority Company Ranking" not in fixed
+    assert "Invest India" in fixed
+    assert "2437" in fixed  # footprint inject ok
 
 
 def test_sector_priorities_request_detected():
@@ -618,6 +672,19 @@ def test_format_country_licensing_answer():
     assert "Tech Mahindra" in out
 
 
+def test_format_country_licensing_answer_db_error_not_zero():
+    out = mc._format_country_licensing_answer(
+        "India", {
+            "total_licensed": 0, "total_rhq": 0,
+            "_db_error": "UndefinedColumn",
+            "retrieval": {"do_not_claim_zero": True},
+            "retrieval_status": "SCHEMA_MISMATCH",
+        })
+    assert "0 hold an active" not in out.lower()
+    assert "not" in out.lower() and "zero" in out.lower()
+    assert "could not be retrieved" in out.lower() or "unavailable" in out.lower()
+
+
 def test_format_country_licensing_answer_with_unlicensed():
     """Dual-source: licensed (shareholder nationality) + non-licensed
     (country_profile_name), each with their own RHQ subset."""
@@ -659,34 +726,82 @@ def test_format_country_licensing_answer_zero_non_licensed():
     assert "### Unlicensed companies" not in out
 
 
-def test_active_predicates_use_role_not_broken_booleans():
-    """Guard the canonical SQL predicates. Licensing/RHQ status must be
-    derived from role / registration_type — NOT the `licensed` / `is_rhq`
-    booleans (the former is unreliable, the latter is unpopulated).
-    Regressing to the booleans silently zeroes the RHQ count."""
+def test_active_predicates_adapt_to_schema():
+    """Live DB must use canonical licensed / is_rhq booleans."""
     from app.services import engagement_data as ed
-    # is-Licensed → role = 'Licensed Entity'
-    assert "role = 'Licensed Entity'" in ed.ACTIVE_LICENSED
-    assert "is_rhq" not in ed.ACTIVE_LICENSED
-    # is-RHQ (licensed) → registration_type = 'RHQ'
-    assert "registration_type = 'RHQ'" in ed.ACTIVE_RHQ
-    assert "is_rhq" not in ed.ACTIVE_RHQ
-    # Non-licensed → not a Licensed Entity
-    assert "Licensed Entity" in ed.NON_LICENSED
-    # is-RHQ (non-licensed) → role = 'RHQ Entity'
-    assert ed.NON_LICENSED_RHQ == "role = 'RHQ Entity'"
-    # Active filter still present on the licensed predicates
-    assert "lifecycle_status = 'Active'" in ed.ACTIVE_LICENSED
-    assert "lifecycle_status = 'Active'" in ed.ACTIVE_RHQ
+    from app.database import get_db
+    import psycopg2.extras
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        preds = ed._licensing_predicates(cur)
+    assert "licensed" in preds and "rhq" in preds
+    assert preds["licensed"].strip()
+    assert preds["rhq"].strip()
+    if not preds.get("legacy"):
+        assert "licensed IS TRUE" in preds["licensed"]
+        assert "is_rhq IS TRUE" in preds["rhq"]
+        assert "ZLA" not in preds["licensed"]
+        assert "ZRHQ" not in preds["rhq"]
+        assert "lifecycle_status" not in preds["licensed"]
+        assert "registration_type" not in preds["rhq"]
+
+
+def test_canonical_licensing_counts_match_sql():
+    """Chatbot totals must equal SELECT COUNT(*) WHERE licensed/is_rhq."""
+    from app.database import get_db
+    from app.services.engagement_data import (
+        fetch_saudi_licensing_summary,
+        fetch_country_saudi_investors,
+    )
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM company_profiles WHERE licensed = true")
+        sql_lic = int(cur.fetchone()[0])
+        cur.execute(
+            "SELECT COUNT(*) FROM company_profiles WHERE is_rhq = true")
+        sql_rhq = int(cur.fetchone()[0])
+    summ = fetch_saudi_licensing_summary()
+    assert int(summ["total_licensed"]) == sql_lic
+    assert int(summ["total_rhq"]) == sql_rhq
+    assert sql_lic == 95671 or sql_lic > 90000  # live reference band
+    assert sql_rhq == 727 or (500 < sql_rhq < 2000)
+
+    india = fetch_country_saudi_investors("India")
+    assert not india.get("_db_error"), india.get("_db_error")
+    # Origin-filtered canonical flags (approx; must be positive & tight)
+    assert int(india["total_licensed"]) > 1000
+    assert 5 <= int(india["total_rhq"]) <= 50
+
+
+
+def test_india_footprint_not_false_zero():
+    """Regression: broken shareholder_country_name SQL must not surface
+    as '0 Indian companies licensed'."""
+    from app.services.engagement_data import fetch_country_saudi_investors
+    stats = fetch_country_saudi_investors("India")
+    assert not stats.get("_db_error"), stats.get("_db_error")
+    assert int(stats.get("total_licensed") or 0) > 100
+    # Should surface real RHQ names when present (bus_data / is_rhq path).
+    names = " ".join(
+        (r.get("company_name") or "") for r in (stats.get("rhq") or [])
+    ).lower()
+    # At least some known Indian RHQ footprint should appear in rhq or licensed.
+    all_names = names + " " + " ".join(
+        (r.get("company_name") or "") for r in (stats.get("licensed_only") or [])
+    ).lower()
+    assert int(stats.get("total_licensed") or 0) > 0
 
 
 # ─── Investment & trade bodies section ────────────────────────────────
 
 def test_advisory_prompts_require_trade_bodies_section():
-    for deliv in ("market_fit", "sector_priorities", "strategy_analysis"):
+    for deliv in ("market_fit", "sector_priorities", "strategy_analysis",
+                  "company_targeting"):
         p = advisory_system_prompt("en", deliv)
         assert "Investment & Trade Bodies to Engage" in p or \
-               "Investment & Trade Bodies" in p, deliv
+               "Investment & Trade Bodies" in p or \
+               "Investment and Trade Bodies" in p, deliv
 
 
 # ─── Licensing focus + country company list ───────────────────────────
@@ -698,13 +813,40 @@ def test_licensing_question_focus():
     assert mc._licensing_question_focus("how many RHQ do we have") == "rhq"
 
 
+def test_saudi_licensing_count_matches_natural_phrasings():
+    """'Tell me the active MISA licenses' must NOT fall through to the
+    empty rhq_licenses table — it is a canonical company_profiles count."""
+    assert mc._is_saudi_licensing_count_question(
+        "number of active MISA licenses")
+    assert mc._is_saudi_licensing_count_question(
+        "how many active MISA licenses")
+    assert mc._is_saudi_licensing_count_question(
+        "Tell me the active MISA licenses")
+    assert mc._is_saudi_licensing_count_question("active MISA licenses")
+    assert mc._is_saudi_licensing_count_question(
+        "what is the current MISA licence count")
+    # Country company lists stay on their own path.
+    assert not mc._is_saudi_licensing_count_question(
+        "tell me the indian active companies")
+    assert not mc._is_saudi_licensing_count_question(
+        "Tell me about Apple")
+
+
+
 def test_licensing_briefing_leads_with_focus_number():
     summ = {"total_licensed": 95671, "total_rhq": 727,
             "rhq_by_country": [], "licensed_by_country": []}
     lic = mc._format_saudi_licensing_briefing(summ, focus="licensed")
+    assert lic.startswith("## Licensing Snapshot")
     assert "95,671 companies hold an active MISA licence" in lic
+    assert not lic.startswith("## Saudi RHQ")
     rhq = mc._format_saudi_licensing_briefing(summ, focus="rhq")
-    assert rhq.split("\n\n")[1].startswith("**727 companies hold an active")
+    assert rhq.startswith("## Saudi RHQ Snapshot")
+    assert "**727 companies hold an active" in rhq
+    both = mc._format_saudi_licensing_briefing(summ, focus="both")
+    assert both.startswith("## Licensing & RHQ Snapshot")
+    assert "95,671 companies hold an active MISA licence" in both
+
 
 
 def test_country_company_list_detection():

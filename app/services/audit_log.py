@@ -337,6 +337,11 @@ def emit_application_event(request: Request, payload: dict) -> None:
             **{k: _truncate(v) if isinstance(v, str) else v
                for k, v in payload.items()},
         }
+        try:
+            from app.services.prompt_masking import mask_obj
+            event = mask_obj(event, for_log=True)
+        except Exception:
+            pass
         _audit_logger.info(
             json.dumps(event, ensure_ascii=False, default=str)
         )

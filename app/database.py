@@ -542,12 +542,19 @@ from app.config import (
     AZURE_OPENAI_API_VERSION,
     AZURE_OPENAI_DEPLOYMENT,
     AZURE_OPENAI_ADVISORY_DEPLOYMENT,
+    DATA_LLM_BASE_URL,
+    DATA_LLM_API_KEY,
+    DATA_LLM_MODEL,
+    DATA_LLM_MAX_TOKENS,
+    RESIDENCY_STRICT,
 )
 
 # Lazy singleton — typed as the OpenAI base since AzureOpenAI inherits
 # from it and exposes the same chat.completions / responses surface.
 _openai_client_inst: OpenAI | None = None
 _public_openai_client_inst: OpenAI | None = None
+_data_llm_client_inst: OpenAI | None = None
+_data_llm_client_failed: bool = False
 
 
 def _patch_azure_model_routing(
@@ -657,28 +664,113 @@ def get_openai_client() -> OpenAI | None:
     return _openai_client_inst
 
 
+def get_question_llm_client() -> OpenAI | None:
+    """LLM for QUESTION-ONLY calls (intent, SQL routing). Never pass DB rows."""
+    return get_openai_client()
+
+
+def get_data_llm_client() -> OpenAI | None:
+    """LLM for DATA-GROUNDED calls (curation, docs, deep profile).
+
+    Under MISA_RESIDENCY_MODE=strict + MISA_DATA_LLM_BACKEND=ollama this is
+    a local OpenAI-compatible client. Postgres rows stay on the machine.
+    """
+    global _data_llm_client_inst, _data_llm_client_failed
+
+    from app.services.llm_residency import (
+        assert_can_send_payload,
+        audit_llm_call,
+        data_backend,
+        data_model_name,
+    )
+
+    assert_can_send_payload("data_grounded", path="get_data_llm_client")
+    backend = data_backend()
+    if backend != "ollama":
+        client = get_openai_client()
+        if client is not None:
+            audit_llm_call(
+                path="get_data_llm_client",
+                payload_class="data_grounded",
+                backend=backend,
+                model=data_model_name(),
+            )
+        return client
+
+    if _data_llm_client_failed:
+        return None
+    if _data_llm_client_inst is not None:
+        return _data_llm_client_inst
+
+    try:
+        client = OpenAI(
+            base_url=DATA_LLM_BASE_URL,
+            api_key=DATA_LLM_API_KEY or "ollama",
+        )
+        original_create = client.chat.completions.create
+        local_model = DATA_LLM_MODEL or "llama3.1"
+
+        def routed_create(*args, **kwargs):
+            kwargs["model"] = local_model
+            kwargs.pop("store", None)
+            kwargs.pop("seed", None)
+            # Ollama's OpenAI-compat layer expects max_tokens, not
+            # max_completion_tokens (Azure/newer OpenAI).
+            if "max_completion_tokens" in kwargs and "max_tokens" not in kwargs:
+                kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+            else:
+                kwargs.pop("max_completion_tokens", None)
+            # Hard cap — high budgets make llama3.1 loop the same
+            # Strategic Read / Live Web block for pages.
+            cap = int(DATA_LLM_MAX_TOKENS or 1024)
+            cur = kwargs.get("max_tokens")
+            try:
+                cur_n = int(cur) if cur is not None else cap
+            except (TypeError, ValueError):
+                cur_n = cap
+            kwargs["max_tokens"] = min(cur_n, cap)
+            # Local compose: deterministic + stop early on footer.
+            kwargs["temperature"] = 0
+            stop = list(kwargs.get("stop") or [])
+            for s in (
+                "\n## From your documents",
+                "\n## From the web",
+                "\n## From MISA data",
+            ):
+                if s not in stop:
+                    stop.append(s)
+            kwargs["stop"] = stop
+            return original_create(*args, **kwargs)
+
+        client.chat.completions.create = routed_create  # type: ignore[assignment]
+        _data_llm_client_inst = client
+        audit_llm_call(
+            path="get_data_llm_client",
+            payload_class="data_grounded",
+            backend="ollama",
+            model=local_model,
+        )
+        return _data_llm_client_inst
+    except Exception as e:
+        from app.logger import logger
+        logger.error(f"data LLM (Ollama) client init failed: {e}")
+        _data_llm_client_failed = True
+        if RESIDENCY_STRICT:
+            raise
+        return None
+
+
 def get_public_openai_client() -> OpenAI | None:
-    """Returns a singleton OpenAI client wired to the PUBLIC API
-    (api.openai.com), regardless of MISA_USE_AZURE_OPENAI.
+    """Public api.openai.com client for web-search-preview only.
 
-    Why this exists: Azure OpenAI does not yet host the
-    `gpt-4o-mini-search-preview` (and `gpt-4o-search-preview`) models
-    used for live web grounding in /profile and executive_succession
-    flows. When Azure mode is on, the deployment-name patch on the
-    main client transparently rewrites the model to the configured
-    Azure deployment — which has NO search capability — so the web
-    search call silently returns an empty result set and the user
-    sees "no reliable web sources" even when the web has plenty.
-
-    web_search.py uses THIS client so the search-preview model is
-    actually reachable. Privacy posture unchanged: web search only
-    ever sends the user's question / entity name to OpenAI; no DB
-    rows are involved in this call.
-
-    Falls back to None when no public OPENAI_API_KEY is configured.
-    Callers must handle that (web_search degrades gracefully).
+    Under residency strict with MISA_RESIDENCY_ALLOW_PUBLIC_WEB=false
+    this returns None (public egress sealed). Web search never sends
+    DB rows — only question / entity text.
     """
     global _public_openai_client_inst
+    from app.services.llm_residency import public_web_allowed
+    if not public_web_allowed():
+        return None
     if _public_openai_client_inst is not None:
         return _public_openai_client_inst
     if not OPENAI_API_KEY.startswith("sk-REPLACE") and OPENAI_API_KEY:
@@ -710,16 +802,24 @@ def _is_text_col_for_substring(table: str, col: str) -> bool:
 
 def _build_where_clauses(
     table: str, filters: dict, allowed_filters: set
-) -> tuple[list[str], list]:
+) -> tuple[list[str], list, list[str]]:
     """Translate the {col: {op, value}} filter dict into parameterized
-    WHERE-clause fragments + the matching params list. Unknown columns
-    and invalid identifiers are silently dropped (caller is responsible
-    for noticing if ALL filters were dropped)."""
+    WHERE-clause fragments + the matching params list.
+
+    Returns ``(where_clauses, params, dropped_columns)``. Unknown columns
+    and invalid identifiers are listed in ``dropped_columns`` so callers
+    can surface INVALID_QUERY / PARTIAL_RESULT instead of silently
+    querying an unfiltered universe.
+    """
     from app.db_introspect import is_valid_identifier
     where_clauses: list[str] = []
     params: list = []
+    dropped: list[str] = []
     for col, raw in _coerce_filters_mapping(filters).items():
+        if str(col).startswith("_"):
+            continue  # internal trace markers
         if col not in allowed_filters or not is_valid_identifier(col):
+            dropped.append(str(col))
             continue
         condition = _normalize_filter_condition(raw)
         op = condition.get("op", "=")
@@ -741,7 +841,9 @@ def _build_where_clauses(
             placeholders = ", ".join(["%s"] * len(val))
             where_clauses.append(f"{col} IN ({placeholders})")
             params.extend(val)
-    return where_clauses, params
+        else:
+            dropped.append(str(col))
+    return where_clauses, params, dropped
 
 
 def count_table_rows(table: str, filters: dict) -> tuple[int, str, list]:
@@ -759,12 +861,13 @@ def count_table_rows(table: str, filters: dict) -> tuple[int, str, list]:
     if not is_valid_identifier(table):
         raise ValueError(f"Invalid table identifier: {table}")
     allowed_filters = set(hints["filterable"])
-    where_clauses, params = _build_where_clauses(table, filters or {}, allowed_filters)
+    where_clauses, params, dropped = _build_where_clauses(table, filters or {}, allowed_filters)
     user_facing_cols = [k for k in (filters or {}).keys() if not k.startswith("_")]
     if user_facing_cols and not where_clauses:
         raise ValueError(
             f"none of the requested filter columns "
             f"({user_facing_cols}) are valid on `{table}`"
+            + (f"; dropped={dropped}" if dropped else "")
         )
     sql = f"SELECT COUNT(*) AS n FROM {_table_source_sql(table)}"
     if where_clauses:
@@ -820,7 +923,16 @@ def generate_query_and_run_query(
 
     allowed_filters = set(hints["filterable"])
     allowed_sort = set(hints["sortable"])
-    where_clauses, params = _build_where_clauses(table, filters, allowed_filters)
+    where_clauses, params, dropped = _build_where_clauses(table, filters, allowed_filters)
+    user_facing_cols = [k for k in (filters or {}).keys() if not str(k).startswith("_")]
+    # If the caller supplied filters and ALL were dropped, refuse to run
+    # an unfiltered query (would look like authoritative data for the
+    # wrong universe).
+    if user_facing_cols and not where_clauses and dropped:
+        raise ValueError(
+            f"INVALID_QUERY: all filters dropped on `{table}` "
+            f"(dropped={dropped}). Refusing unfiltered result set."
+        )
 
     sql = f"SELECT * FROM {_table_source_sql(table)}"
     if where_clauses:
@@ -841,6 +953,12 @@ def generate_query_and_run_query(
             for fld in REDACTED_FIELDS_FOR_NON_LEADERSHIP[table]:
                 if fld in df.columns:
                     df[fld] = "[REDACTED — PDPL]"
+        if dropped:
+            try:
+                df.attrs["dropped_filters"] = list(dropped)
+                df.attrs["retrieval_status"] = "PARTIAL_RESULT"
+            except Exception:
+                pass
         return df, sql, params
 
     return _run_with_db_transient_retry(_exec)
@@ -858,14 +976,33 @@ def _drop_sensitive_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def run_rhq_company_smart_search(terms: list[str], limit: int = 25):
+    """Fuzzy company search. On success returns (df, sql, params).
+
+    On failure returns an empty DataFrame with SQL prefixed by
+    ``-- RETRIEVAL_FAILED`` so callers can distinguish outage from a
+    verified empty match via ``smart_search_retrieval_failed(sql)``.
+    Never silently pretend DB failure is "no companies found".
+    """
     try:
         return _run_rhq_company_smart_search_impl(terms, limit)
     except Exception as e:
+        err = f"{type(e).__name__}: {e}"
         return (
             pd.DataFrame(),
-            f"-- company_profiles smart_search failed: {type(e).__name__}: {e}",
+            f"-- RETRIEVAL_FAILED company_profiles smart_search: {err}",
             [],
         )
+
+
+def smart_search_retrieval_failed(sql: str | None) -> bool:
+    """True when ``run_rhq_company_smart_search`` returned a failure marker."""
+    return bool(sql) and "-- RETRIEVAL_FAILED" in str(sql)
+
+
+def smart_search_failure_message(sql: str | None) -> str:
+    if not smart_search_retrieval_failed(sql):
+        return ""
+    return str(sql).replace("-- RETRIEVAL_FAILED company_profiles smart_search: ", "").strip()
 
 
 def _run_rhq_company_smart_search_impl(terms: list[str], limit: int = 25):

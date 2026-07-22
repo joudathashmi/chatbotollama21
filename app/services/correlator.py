@@ -101,7 +101,13 @@ def _fan_out(jobs: dict[str, tuple[str, tuple]], max_workers: int = 8
     """Run a dict of {section_name: (sql, params)} jobs in parallel.
     Returns (results_dict, errors_dict). Sections that error get
     `[]` in results and the error text in errors so the curator
-    sees a partially-populated bundle rather than a 500."""
+    sees a partially-populated bundle rather than a 500.
+
+    Also injects ``_section_errors`` / ``_retrieval_partial`` keys into
+    ``results`` (as a one-element list of metadata dicts) when any
+    section failed — so prompts cannot treat empty lists as verified
+    absence of meetings/opportunities.
+    """
     results: dict[str, list[dict]] = {}
     errors: dict[str, str] = {}
 
@@ -121,6 +127,20 @@ def _fan_out(jobs: dict[str, tuple[str, tuple]], max_workers: int = 8
             else:
                 results[name] = []
                 errors[name] = out
+    if errors:
+        results["_section_errors"] = [{
+            "retrieval_status": "PARTIAL_RESULT",
+            "do_not_claim_zero": True,
+            "failed_sections": dict(errors),
+            "note": (
+                "Some related-table queries failed. Empty section lists "
+                "for those keys are UNAVAILABLE, not verified empty."
+            ),
+        }]
+        results["_retrieval_partial"] = [{
+            "partial": True,
+            "failed_section_names": sorted(errors.keys()),
+        }]
     return results, errors
 
 

@@ -34,6 +34,9 @@ def build_feedback_context(
         "response_locale": response_locale,
         "cleaned": pack.get("cleaned"),
         "entity_candidate": pack.get("entity_candidate"),
+        "advisory_deliverable": pack.get("_advisory_deliverable"),
+        "answer_source": pack.get("_answer_source"),
+        "short_circuit": pack.get("_short_circuit"),
     }
 
 

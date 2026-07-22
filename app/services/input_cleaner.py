@@ -307,8 +307,8 @@ _BROWSE_TABLE_MAP: dict[str, tuple[str, str]] = {
     "sectors":          ("sectors", "id"),
     "achievements":     ("achievements", "id"),
     "reports":          ("reports", "id"),
-    "licenses":         ("rhq_licenses", "id"),
-    "licences":         ("rhq_licenses", "id"),
+    "licenses":         ("company_profiles", "id"),
+    "licences":         ("company_profiles", "id"),
     "focused sectors":  ("focused_sectors", "id"),
 }
 

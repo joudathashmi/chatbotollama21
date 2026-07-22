@@ -61,6 +61,63 @@ AZURE_OPENAI_ADVISORY_DEPLOYMENT: str = (
     os.getenv("AZURE_OPENAI_ADVISORY_DEPLOYMENT") or AZURE_OPENAI_DEPLOYMENT
 ).strip()
 
+# ---------------------------------------------------------------------------
+# Data residency — raw Postgres dumps must not leave the machine unchecked
+# ---------------------------------------------------------------------------
+# MISA_RESIDENCY_MODE:
+#   standard — legacy (Azure/OpenAI may see privacy-filtered rows)
+#   strict   — local Ollama is the default for data-grounded calls UNLESS
+#              MISA_NARRATIVE_CLOUD=true (Jul21-quality narrative over
+#              privacy-filtered fact cards via Azure/OpenAI).
+_residency_raw = (os.getenv("MISA_RESIDENCY_MODE") or "standard").strip().lower()
+RESIDENCY_MODE: str = _residency_raw if _residency_raw in ("standard", "strict") else "standard"
+RESIDENCY_STRICT: bool = RESIDENCY_MODE == "strict"
+
+_data_backend = (os.getenv("MISA_DATA_LLM_BACKEND") or (
+    "ollama" if RESIDENCY_STRICT else "azure"
+)).strip().lower()
+DATA_LLM_BACKEND: str = (
+    _data_backend if _data_backend in ("ollama", "azure", "openai") else "ollama"
+)
+DATA_LLM_BASE_URL: str = (
+    os.getenv("MISA_DATA_LLM_BASE_URL") or "http://127.0.0.1:11434/v1"
+).strip().rstrip("/")
+DATA_LLM_API_KEY: str = (os.getenv("MISA_DATA_LLM_API_KEY") or "ollama").strip()
+DATA_LLM_MODEL: str = (os.getenv("MISA_DATA_LLM_MODEL") or "llama3.1").strip()
+# Local models loop / ramble when given Azure-sized budgets. Cap hard.
+try:
+    DATA_LLM_MAX_TOKENS: int = int(
+        (os.getenv("MISA_DATA_LLM_MAX_TOKENS") or "1024").strip() or "1024"
+    )
+except ValueError:
+    DATA_LLM_MAX_TOKENS = 1024
+
+# Under strict: may public OpenAI see *question text only* for web search?
+RESIDENCY_ALLOW_PUBLIC_WEB: bool = (os.getenv("MISA_RESIDENCY_ALLOW_PUBLIC_WEB") or (
+    "false" if RESIDENCY_STRICT else "true"
+)).strip().lower() in ("1", "true", "yes", "on")
+RESIDENCY_BLOCK_PUBLIC_ENGAGEMENT: bool = RESIDENCY_STRICT and (
+    os.getenv("MISA_RESIDENCY_BLOCK_PUBLIC_ENGAGEMENT") or "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Jul21 narrative quality: send privacy-filtered fact cards to Azure/OpenAI
+# for compose (NOT raw dumps). Default on — templates are fallback only.
+# Set MISA_NARRATIVE_CLOUD=false for hard Ollama-only residency.
+NARRATIVE_CLOUD_ENABLED: bool = (
+    os.getenv("MISA_NARRATIVE_CLOUD") or "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# DB briefing templates (fallback when cloud narrative fails / disabled):
+#   auto          — prefer cloud narrative when NARRATIVE_CLOUD; else templates
+#   deterministic — always template from rows (fast; lower narrative quality)
+#   ollama / llm  — force LLM curation path (never short-circuit to templates)
+_db_brief_raw = (os.getenv("MISA_DB_BRIEFING_MODE") or "auto").strip().lower()
+DB_BRIEFING_MODE: str = (
+    _db_brief_raw if _db_brief_raw in (
+        "auto", "deterministic", "ollama", "llm", "db", "template",
+    ) else "auto"
+)
+
 
 def openai_max_completion_tokens_kw() -> dict:
     raw = (os.getenv("OPENAI_MAX_COMPLETION_TOKENS") or "3072").strip()
@@ -83,19 +140,23 @@ ADVISORY_MODEL: str = (
 # ---------------------------------------------------------------------------
 # Determinism / reproducibility
 # ---------------------------------------------------------------------------
-# The same question should yield substantially the SAME answer each time —
-# a government decision-support tool must not reword its intelligence on
-# every run. Content-generating calls therefore use a low temperature and a
-# fixed seed. Note: OpenAI is only *best-effort* deterministic even at
-# temperature 0 (backend/MoE non-determinism), so minor wording drift can
-# still occur; this removes the large, deliberate randomness, not all of it.
+# The same question should yield the SAME Jul21 *structure* every run
+# (sections, depth, named recs). Content-generating calls use temperature 0
+# + a fixed seed. OpenAI is only *best-effort* deterministic for free prose,
+# so residual wording drift is closed by:
+#   1) soft_check + deterministic template repair (company/person),
+#   2) jul21_surface inject of Strategic Context / Recommended,
+#   3) optional single-turn response cache (MISA_RESPONSE_CACHE=true)
+#      for byte-identical repeats within TTL.
 CHAT_TEMPERATURE: float = float(os.getenv("MISA_CHAT_TEMPERATURE", "0") or "0")
 _seed_raw = (os.getenv("MISA_CHAT_SEED") or "7").strip()
 
 def openai_determinism_kw() -> dict:
-    """temperature + seed for content-generating calls, so the same
-    question reproduces the same answer as closely as the API allows.
-    Set MISA_CHAT_SEED='' to disable seeding."""
+    """temperature + seed for content-generating calls.
+
+    Structure/depth is contract-locked in finalize — this only reduces
+    deliberate LLM randomness. Set MISA_CHAT_SEED='' to disable seeding.
+    """
     kw: dict = {"temperature": CHAT_TEMPERATURE}
     if _seed_raw not in ("", "off", "none"):
         try:
@@ -221,6 +282,11 @@ CHAT_MAX_ROWS_PER_TURN: int = max(1, int(os.getenv("MISA_CHAT_MAX_ROWS_PER_TURN"
 # ---------------------------------------------------------------------------
 LOG_TURNS: bool = os.getenv("MISA_LOG_TURNS", "").strip().lower() in ("1", "true", "yes")
 LOG_FILE: str = (os.getenv("MISA_LOG_FILE") or "").strip()
+# Prompt masking (PII/secrets on LLM egress + logs). Default ON.
+# Does not rewrite business facts in user-facing answers.
+PROMPT_MASKING: bool = os.getenv("MISA_PROMPT_MASKING", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 
 MAX_USER_MESSAGE_CHARS: int = 12_000
 

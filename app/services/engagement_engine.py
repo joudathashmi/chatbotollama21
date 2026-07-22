@@ -18,6 +18,17 @@ from app.prompts.engagement_system import build_system_prompt, detect_response_l
 
 
 def _get_async_client() -> AsyncOpenAI:
+    from app.services.llm_residency import public_engagement_allowed
+    if not public_engagement_allowed():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Engagement dossiers are disabled under "
+                "MISA_RESIDENCY_MODE=strict (public OpenAI egress blocked). "
+                "Set MISA_RESIDENCY_BLOCK_PUBLIC_ENGAGEMENT=false only if "
+                "policy allows sending entity/context text to api.openai.com."
+            ),
+        )
     if not ENGAGEMENT_OPENAI_KEY or ENGAGEMENT_OPENAI_KEY.startswith("sk-REPLACE"):
         raise HTTPException(
             status_code=503,

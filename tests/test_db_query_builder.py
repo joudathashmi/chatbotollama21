@@ -99,16 +99,13 @@ def test_substring_column_uses_ilike(fake_conn):
 
 
 def test_unknown_filter_column_is_dropped(fake_conn):
-    generate_query_and_run_query(
-        COMPANY_TABLE,
-        filters={"password_hash": {"op": "=", "value": "x"}},
-    )
-    sql, params = fake_conn.last_query()
-    # Not allowlisted → the column never reaches the SQL and binds no params.
-    # (company_profiles' projection subquery has its own internal WHERE, so
-    # we assert on the dropped column + empty params, not absence of WHERE.)
-    assert "password_hash" not in sql
-    assert params == []
+    """All-unknown filters must refuse an unfiltered query (quality:
+    silent drop previously returned the whole table as if filtered)."""
+    with pytest.raises(ValueError, match="INVALID_QUERY|all filters dropped"):
+        generate_query_and_run_query(
+            COMPANY_TABLE,
+            filters={"password_hash": {"op": "=", "value": "x"}},
+        )
 
 
 def test_order_by_allowlisted_column_applied(fake_conn):

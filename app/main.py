@@ -569,11 +569,42 @@ function setCurrentSession(id) {
   } catch (e) {}
 }
 function chatPayload(question, extra) {
+  // Never send citation HTML back in history — the API rejects markup on
+  // questions and used to 422 on history too (UI showed "Error: [object Object]").
+  const cleanHistory = (history || []).map(m => ({
+    role: m.role,
+    content: stripHtmlForHistory(m.content || ''),
+  }));
   const body = Object.assign({
-    question, history, locale: uiLocale,
+    question, history: cleanHistory, locale: uiLocale,
   }, extra || {});
   if (SESSIONS_ENABLED && currentSessionId) body.session_id = currentSessionId;
   return body;
+}
+function stripHtmlForHistory(text) {
+  if (!text) return text;
+  return String(text)
+    .replace(/<sup\b[^>]*class=["']?cite["']?[^>]*>(\d+)<\/sup>/gi, '[web:$1]')
+    .replace(/<sup\b[^>]*class=["']?cite["']?[^>]*>[^<]*<\/sup>/gi, '[doc]')
+    .replace(/<\/?[a-zA-Z][^>]*>/g, '');
+}
+function formatApiError(d) {
+  if (d == null) return 'unknown';
+  if (typeof d === 'string') return d;
+  if (typeof d.error === 'string') return d.error;
+  if (d.error && typeof d.error === 'object') {
+    const msg = d.error.message || d.error.code || '';
+    const details = d.error.details ? ' — ' + String(d.error.details).slice(0, 240) : '';
+    return (msg || 'Request failed') + details;
+  }
+  if (typeof d.message === 'string') return d.message;
+  if (d.detail) {
+    if (typeof d.detail === 'string') return d.detail;
+    if (Array.isArray(d.detail)) {
+      return d.detail.map(x => x.msg || JSON.stringify(x)).join('; ');
+    }
+  }
+  try { return JSON.stringify(d).slice(0, 300); } catch (e) { return 'Request failed'; }
 }
 function setTokens(a, r) {
   if (a) sessionStorage.setItem(ACCESS_KEY, a);
@@ -1009,6 +1040,7 @@ async function tryStreaming(question, t0) {
   let buf = '';
   let assistantEl = null;
   let accumulated = '';
+  let plainAnswer = '';
   let sawChunk = false;
   let statusEl = null;
   let lastSources = null;
@@ -1037,6 +1069,7 @@ async function tryStreaming(question, t0) {
       }
       sawChunk = true;
       accumulated += evt.text || '';
+      plainAnswer = accumulated;
       // Re-render markdown each tick. For long answers this is fine;
       // marked.parse is fast enough; DOMPurify strips script/on* XSS.
       assistantEl.innerHTML = safeMarkdownHtml(accumulated);
@@ -1045,18 +1078,20 @@ async function tryStreaming(question, t0) {
       // Polished post-stream rewrite (citations preserved when present).
       if (statusEl) { statusEl.remove(); statusEl = null; }
       if (evt.text) {
+        plainAnswer = evt.text;
         accumulated = evt.text;
         if (!assistantEl) {
           assistantEl = addMsg('assistant', '');
         }
         sawChunk = true;
+        assistantEl.innerHTML = safeMarkdownHtml(accumulated);
       }
     } else if (evt.type === 'rows') {
       // we don't render the structured rows panel in the test UI
     } else if (evt.type === 'error') {
       if (statusEl) { statusEl.remove(); statusEl = null; }
       const e = assistantEl || addMsg('assistant', '');
-      e.textContent = 'Error: ' + (evt.message || 'unknown');
+      e.textContent = 'Error: ' + formatApiError(evt);
       e.classList.add('err');
       addRecoveryRow(evt.recovery || ['retry', 'rephrase', 'documents']);
     } else if (evt.type === 'done') {
@@ -1066,8 +1101,9 @@ async function tryStreaming(question, t0) {
         if (SESSIONS_ENABLED) loadSessionList();
       }
       lastSources = evt.sources || evt.web_sources || null;
-      if (assistantEl && accumulated) {
-        const linked = linkCitations(accumulated, lastSources || []);
+      if (assistantEl && (plainAnswer || accumulated)) {
+        const base = plainAnswer || accumulated;
+        const linked = linkCitations(base, lastSources || []);
         assistantEl.innerHTML = safeMarkdownHtml(linked);
         accumulated = linked;
       }
@@ -1077,12 +1113,12 @@ async function tryStreaming(question, t0) {
       // Update history + feedback row
       if (sawChunk) {
         addFeedbackRow({
-          question, answer: accumulated,
+          question, answer: plainAnswer || accumulated,
           trace: evt.trace || [], debug: null,
           webSources: lastSources || null,
         });
         history.push({role: 'user',      content: question});
-        history.push({role: 'assistant', content: accumulated});
+        history.push({role: 'assistant', content: plainAnswer || stripHtmlForHistory(accumulated)});
         if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
       } else {
         addRecoveryRow(['retry', 'rephrase', 'documents']);
@@ -1189,12 +1225,13 @@ form.addEventListener('submit', async (e) => {
       if (SESSIONS_ENABLED) loadSessionList();
     }
     const dt = ((performance.now() - t0) / 1000).toFixed(1);
-    if (d.error) {
-      const e = addMsg('assistant', 'Error: ' + d.error); e.classList.add('err');
+    if (!r.ok || d.error || d.success === false) {
+      const e = addMsg('assistant', 'Error: ' + formatApiError(d)); e.classList.add('err');
       addRecoveryRow(['retry', 'rephrase', 'documents']);
     } else {
       let ans = d.answer || '(empty)';
       const srcList = d.sources || d.web_sources || [];
+      const plainForHistory = ans; // markdown without citation HTML
       ans = linkCitations(ans, srcList);
       const ansEl = addMsg('assistant', ans);
       if (srcList.length) addSourcesFooter(srcList);
@@ -1209,7 +1246,7 @@ form.addEventListener('submit', async (e) => {
       // promotion. The buttons stay visible until clicked, then lock.
       addFeedbackRow({
         question,
-        answer: ans,
+        answer: plainForHistory,
         trace: d.trace || [],
         debug: d.debug || null,
         webSources: srcList || null,
@@ -1217,7 +1254,7 @@ form.addEventListener('submit', async (e) => {
       // Append the user question and the assistant's answer to history
       // so the NEXT turn carries the context.
       history.push({role: 'user',      content: question});
-      history.push({role: 'assistant', content: ans});
+      history.push({role: 'assistant', content: plainForHistory});
       if (history.length > MAX_HISTORY) {
         history = history.slice(-MAX_HISTORY);
       }
@@ -1628,13 +1665,15 @@ async def health_data(country: str = "India",
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM company_profiles")
             out["company_profiles_rows"] = cur.fetchone()[0]
-            from app.services.engagement_data import ACTIVE_LICENSED, ACTIVE_RHQ
+            from app.services.engagement_data import _licensing_predicates
+            preds = _licensing_predicates(cur)
             cur.execute(
-                f"SELECT COUNT(*) FROM company_profiles WHERE {ACTIVE_LICENSED}")
+                f"SELECT COUNT(*) FROM company_profiles WHERE {preds['licensed']}")
             out["licensed_total"] = cur.fetchone()[0]
             cur.execute(
-                f"SELECT COUNT(*) FROM company_profiles WHERE {ACTIVE_RHQ}")
+                f"SELECT COUNT(*) FROM company_profiles WHERE {preds['rhq']}")
             out["rhq_total"] = cur.fetchone()[0]
+            out["predicate_source"] = preds.get("source")
             like = f"%{country.strip()}%"
             cur.execute(
                 "SELECT COUNT(*) FROM company_profiles "
@@ -1642,11 +1681,11 @@ async def health_data(country: str = "India",
             out[f"hq_{country.lower()}_rows"] = cur.fetchone()[0]
             cur.execute(
                 f"SELECT COUNT(*) FROM company_profiles "
-                f"WHERE headquarters ILIKE %s AND {ACTIVE_LICENSED}", (like,))
+                f"WHERE headquarters ILIKE %s AND {preds['licensed']}", (like,))
             out[f"hq_{country.lower()}_licensed"] = cur.fetchone()[0]
             cur.execute(
                 f"SELECT COUNT(*) FROM company_profiles "
-                f"WHERE headquarters ILIKE %s AND {ACTIVE_RHQ}", (like,))
+                f"WHERE headquarters ILIKE %s AND {preds['rhq']}", (like,))
             out[f"hq_{country.lower()}_rhq"] = cur.fetchone()[0]
         return out
 

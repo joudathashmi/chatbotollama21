@@ -85,6 +85,17 @@ _VOID_TAGS = {"br", "hr"}
 # including all `on*` event handlers and `style`.
 _ALLOWED_ATTRS: dict[str, set[str]] = {
     "a": {"href", "title"},
+    # PDF export injects class/width on tables & profile cards.
+    # `style` is intentionally NOT allowlisted (XSS / css injection).
+    "table": {"class", "width"},
+    "thead": {"class"},
+    "tbody": {"class"},
+    "tr": {"class"},
+    "th": {"class", "width"},
+    "td": {"class", "width"},
+    "div": {"class", "id"},
+    "span": {"class"},
+    "p": {"class"},
 }
 _SAFE_URL_SCHEMES = {"http", "https", "mailto", ""}
 # Elements whose entire text content must be dropped, not just the tag —
@@ -190,3 +201,31 @@ def sanitize_html(html: str) -> str:
     parser.feed(html or "")
     parser.close()
     return parser.get_html()
+
+
+_CITE_SUP_RE = re.compile(
+    r'<sup\b[^>]*\bclass\s*=\s*["\']?cite["\']?[^>]*>(.*?)</sup>',
+    re.I | re.S,
+)
+_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+
+
+def strip_html_to_plaintext(text: str) -> str:
+    """Convert citation HTML / accidental markup in chat history back to
+    plain text so follow-up turns are not rejected by the HTML guard.
+
+    `<sup class="cite">1</sup>` → `[web:1]`; other tags are removed.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    out = _CITE_SUP_RE.sub(
+        lambda m: (
+            f"[web:{m.group(1).strip()}]"
+            if (m.group(1) or "").strip().isdigit()
+            else "[doc]"
+        ),
+        text,
+    )
+    out = _TAG_RE.sub("", out)
+    return out
+

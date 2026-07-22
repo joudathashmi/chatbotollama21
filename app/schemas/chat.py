@@ -5,7 +5,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 from app.config import MAX_USER_MESSAGE_CHARS
-from app.utils.text_validation import reject_html_markup
+from app.utils.text_validation import reject_html_markup, strip_html_to_plaintext
 
 
 class HistoryMessage(BaseModel):
@@ -14,8 +14,13 @@ class HistoryMessage(BaseModel):
 
     @field_validator("content")
     @classmethod
-    def _reject_markup(cls, v):
-        return reject_html_markup(v)
+    def _strip_history_markup(cls, v):
+        # Chat UI may re-send citation HTML (<sup class="cite">) from a
+        # prior turn. Strip it instead of 422 — otherwise every follow-up
+        # after a web-cited answer fails with a cryptic client error.
+        if isinstance(v, str):
+            return strip_html_to_plaintext(v)
+        return v
 
 
 class ChatRequest(BaseModel):
@@ -52,3 +57,9 @@ class ChatResponse(BaseModel):
     session_id: Optional[str] = None
     # Unified sources (documents + web + DB tables) for the always-on panel.
     sources: Optional[list[dict]] = None
+    # Quality / retrieval observability (safe for clients — no PII payloads).
+    trace_id: Optional[str] = None
+    intent: Optional[dict] = None
+    retrieval_status: Optional[str] = None
+    quality: Optional[dict] = None
+    data_limitations: Optional[list[str]] = None

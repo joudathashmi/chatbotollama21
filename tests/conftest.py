@@ -6,6 +6,21 @@ from app.main import app
 
 
 @pytest.fixture(autouse=True)
+def _isolate_local_env(monkeypatch):
+    """Keep the unit suite independent of a developer's local `.env`.
+
+    Local demos often set ``MISA_AUTH_DISABLED=true`` and
+    ``MISA_RESIDENCY_MODE=strict`` (Ollama). Those flags break auth/RBAC
+    assertions and redirect mocked Azure clients to a live Ollama process.
+    Residency / auth tests that need the real flags monkeypatch them back.
+    """
+    monkeypatch.setattr(config, "AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "RESIDENCY_STRICT", False)
+    monkeypatch.setattr(config, "RESIDENCY_MODE", "standard")
+    monkeypatch.setattr(config, "DATA_LLM_BACKEND", "azure")
+
+
+@pytest.fixture(autouse=True)
 def _bypass_auth(monkeypatch):
     """Override auth dependency for all tests — API_USERNAME/PASSWORD are not set in CI.
 

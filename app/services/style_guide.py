@@ -85,8 +85,9 @@ APPROVED_EMOJIS = {"📊", "🇸🇦"}
 # ═══════════════════════════════════════════════════════════════════
 # 3. FORBIDDEN STRINGS (consolidated)
 # ═══════════════════════════════════════════════════════════════════
-# These get stripped by curation._scrub_backend_noise AND checked by
-# the style validator. Adding one here propagates to BOTH paths.
+# These get stripped by answer_finalize.finalize_answer (every composer
+# exit) AND checked by the style validator on the curation path.
+# Adding one here must propagate to BOTH — never only to prompts.
 
 FORBIDDEN_STRINGS = (
     # Confidence tags
@@ -225,6 +226,12 @@ No other emoji anywhere. No emoji in the H1 heading.
 HORIZONTAL RULES (`---`) — use sparingly, ONLY between top-level
 sections in a multi-pillar briefing. Never between bullets.
 
+SOURCE LANES — `## From your documents`, `## From the web`, and
+`## From MISA data` are ONLY for real content from that source.
+If a lane has nothing useful: OMIT the heading entirely. Never write
+"No relevant documents…", "No relevant information from the web…",
+or similar empty stubs.
+
 BOLDING ECONOMY — at most ONE **bolded** phrase per bullet, on the
 critical number or strategic trigger. Bullets with three bolds read
 as noise.
@@ -238,7 +245,7 @@ FOOTER — every answer ends with a single italic source line:
   _Sources: <table_or_column>, <table_or_column>._
 Examples:
   _Sources: company_profiles, company_executives._
-  _Sources: company_profiles.role / registration_type._
+  _Sources: company_profiles.licensed / company_profiles.is_rhq._
 
 FORBIDDEN IN OUTPUT (these are stripped by the post-processor; just
 don't write them in the first place):
