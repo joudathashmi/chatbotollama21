@@ -66,8 +66,11 @@ _FOOTPRINT_HEADING_RE = re.compile(
 
 _TARGETING_SHAPE_RE = re.compile(
     r"(?im)^##\s*Priority Company Ranking\b|"
+    r"^##\s*Target Companies and Investment Thesis Matrix\b|"
+    r"^##\s*Top .{0,40}RHQ Companies in Saudi Arabia\b|"
     r"^#\s*Targeting .+ Companies\b|"
-    r"^#\s*.{0,80}Strategic List and Investment Thesis\b",
+    r"^#\s*.{0,80}Strategic List and Investment Thesis\b|"
+    r"^#\s*.{0,80}Strategic Prioriti[sz]ation and Investment Thesis\b",
 )
 
 _ADVISORY_DOC_MARKERS_RE = re.compile(
@@ -84,7 +87,9 @@ _ADVISORY_DOC_MARKERS_RE = re.compile(
     r"Cross-Cutting Investment Themes|"
     r"Strategic Targeting Recommendations|"
     r"Priority Company Ranking|"
-    r"Detailed Investment Theses"
+    r"Detailed Investment Theses|"
+    r"Target Companies and Investment Thesis Matrix|"
+    r"Recommendations to MISA"
     r")\b"
 )
 
@@ -169,7 +174,7 @@ def ranking_midrow_truncated(answer: str) -> bool:
     if not answer:
         return False
     m = re.search(
-        r"(?is)##\s*Priority Company Ranking\s*(.*?)(?=\n##\s|\Z)",
+        r"(?is)##\s*(?:Priority Company Ranking|Target Companies and Investment Thesis Matrix)\s*(.*?)(?=\n##\s|\Z)",
         answer,
     )
     if not m:

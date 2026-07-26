@@ -30,7 +30,7 @@ def test_company_targeting_deliverable_detected():
     )
     assert mc._detect_advisory_deliverable(q) == "company_targeting"
     p = advisory_system_prompt("en", "company_targeting")
-    assert "Priority Company Ranking" in p
+    assert "Target Companies and Investment Thesis Matrix" in p
     assert "expansion" in p and "new_entry" in p
 
 
@@ -203,7 +203,8 @@ def test_structured_payload_requires_investment_and_separates_types():
     # Ranking must be complete (not truncated mid-row)
     assert ranking_table_is_truncated(md) is False
     # Lean executive ranking (5 cols) — expansion type lives in theses
-    assert "| Rank | Company | Sector | Saudi Presence | Investment Thesis |" in md
+    assert ("| Company Name | Sector | Saudi Sectoral Alignment | "
+            "Investment Thesis | Key Saudi Anchor(s) |") in md
     assert "Strategic Context" in md
     assert "Invest India" in md
     assert "Tech Mahindra" in md

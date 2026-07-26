@@ -302,7 +302,7 @@ def render_company_targeting_markdown(payload: dict) -> str:
     lines.append(strat)
     lines.append("")
 
-    lines.append("## Current Saudi Footprint")
+    lines.append("## Current MISA Footprint")
     status = fp.get("retrieval_status")
     if status in ("error", "SOURCE_UNAVAILABLE", "TIMEOUT", "CONNECTION_ERROR",
                   "UNKNOWN_ERROR") or (
@@ -334,25 +334,88 @@ def render_company_targeting_markdown(payload: dict) -> str:
         lines.append(f"- Limitation: {lim}")
     lines.append("")
 
-    lines.append("## Priority Company Ranking")
+    # PDF-format footprint tables: Top RHQ + Top Licensed (Non-RHQ) with
+    # industry / revenue / one-sentence thesis columns. Rows are assembled
+    # in code so a token limit can never cut them mid-table.
+    origin = _str(fp.get("origin_country"), "Origin")
+    _theses_by_name = {
+        (t.get("company") or "").strip().lower(): t
+        for t in payload.get("targets") or []
+    }
+
+    def _one_line_thesis(name: str, fallback_presence: str) -> str:
+        t = _theses_by_name.get(name.strip().lower()) or {}
+        thesis = (
+            t.get("proposed_investment")
+            or t.get("why_saudi")
+            or t.get("why_company")
+            or f"Engage on Vision 2030 expansion from the existing "
+               f"{fallback_presence} base."
+        )
+        return thesis.replace("|", "/").replace("\n", " ")[:160]
+
+    def _revenue_cell(v) -> str:
+        try:
+            n = float(v)
+            if n > 0:
+                return f"{n:,.0f}"
+        except (TypeError, ValueError):
+            pass
+        return "N/A"
+
+    def _footprint_table(rows: list, presence: str) -> None:
+        lines.append(
+            "| Company Name | Industry | Annual Revenue (USD) | "
+            "Investment Thesis |"
+        )
+        lines.append("|---|---|---|---|")
+        for r in rows:
+            lines.append(
+                "| " + " | ".join([
+                    r["name"].replace("|", "/"),
+                    r["industry"].replace("|", "/"),
+                    _revenue_cell(r.get("annual_revenue")),
+                    _one_line_thesis(r["name"], presence),
+                ]) + " |"
+            )
+        lines.append("")
+
+    rhq_rows = fp.get("top_rhq_rows") or []
+    lic_rows = fp.get("top_licensed_rows") or []
+    if rhq_rows:
+        lines.append(f"## Top {origin} RHQ Companies in Saudi Arabia")
+        lines.append("")
+        _footprint_table(rhq_rows, "RHQ")
+    if lic_rows:
+        lines.append(
+            f"## Top Licensed {origin} Companies in Saudi Arabia (Non-RHQ)"
+        )
+        lines.append("")
+        _footprint_table(lic_rows, "licensed")
+
+    lines.append("## Target Companies and Investment Thesis Matrix")
     lines.append("")
-    # Lean 5-column table so PDF export keeps a real table (not profile
-    # cards). Detail (proposed investment, MISA action) lives in theses.
     lines.append(
-        "| Rank | Company | Sector | Saudi Presence | Investment Thesis |"
+        "| Company Name | Sector | Saudi Sectoral Alignment | "
+        "Investment Thesis | Key Saudi Anchor(s) |"
     )
     lines.append("|---|---|---|---|---|")
     for t in payload["targets"]:
+        fit = t.get("saudi_strategic_fit") or []
+        alignment = (fit[0] if fit else t["sector"]).replace("|", "/")
+        anchors = (
+            ", ".join(fit[1:3]) if len(fit) > 1 else "Vision 2030 programmes"
+        ).replace("|", "/")
         thesis = (t.get("why_company") or "")[:110]
         if t.get("why_saudi"):
-            thesis = (thesis + " " + t["why_saudi"])[:140]
+            thesis = (thesis + " " + t["why_saudi"])[:150]
         thesis = thesis.replace("|", "/").replace("\n", " ")
         row = [
-            str(t["rank"]),
             t["company"].replace("|", "/"),
             t["sector"].replace("|", "/"),
-            t["current_saudi_presence"].replace("|", "/"),
+            alignment,
             thesis,
+            anchors,
         ]
         lines.append("| " + " | ".join(row) + " |")
     lines.append("")
@@ -410,9 +473,9 @@ def render_company_targeting_markdown(payload: dict) -> str:
         lines.append("")
 
     if payload.get("trade_bodies"):
-        lines.append("## Investment and Trade Bodies")
+        lines.append("## Investment & Trade Bodies to Engage")
         lines.append("")
-        lines.append("| Organisation | Type | Role |")
+        lines.append("| Organization Name | Type | Description |")
         lines.append("|---|---|---|")
         for b in payload["trade_bodies"]:
             if not isinstance(b, dict):
@@ -425,7 +488,7 @@ def render_company_targeting_markdown(payload: dict) -> str:
             )
         lines.append("")
 
-    lines.append("## Recommended Next Actions for MISA")
+    lines.append("## Recommendations to MISA")
     # Prefer company-named actions (old Jul21 quality). Generic enrichment
     # bullets without a company name are demoted.
     recs = [r for r in (payload.get("recommendations") or []) if r]
@@ -575,6 +638,23 @@ def seed_company_targeting_payload_from_db(
     licensed = db_context.get("companies_from_origin_licensed_in_saudi")
     rhq = db_context.get("companies_from_origin_with_rhq")
     status = _str(db_context.get("retrieval_status"), "ok")
+
+    # Footprint tables (PDF shape): keep name/industry/revenue rows so the
+    # renderer can emit the Top RHQ / Top Licensed tables verbatim.
+    def _fp_rows(key: str) -> list[dict]:
+        rows = []
+        for r in (db_context.get(key) or [])[:8]:
+            name = _str(r.get("name") or r.get("company"))
+            if not name:
+                continue
+            rows.append({
+                "name": name,
+                "industry": _str(r.get("industry"), "Unclassified"),
+                "annual_revenue": r.get("annual_revenue"),
+            })
+        return rows
+    top_rhq_rows = _fp_rows("top_rhq_companies")
+    top_licensed_rows = _fp_rows("top_licensed_companies")
     leads = [
         _str(t.get("name") or t.get("company"))
         for t in (
@@ -611,6 +691,8 @@ def seed_company_targeting_payload_from_db(
                 "origin filters; informal presence is out of scope.",
             ],
             "leading_companies": leads,
+            "top_rhq_rows": top_rhq_rows,
+            "top_licensed_rows": top_licensed_rows,
         },
         "targets": targets,
         "trade_bodies": _default_trade_bodies(country),

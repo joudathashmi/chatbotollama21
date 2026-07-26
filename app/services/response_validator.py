@@ -365,7 +365,9 @@ def validate_advisory_answer(
         and counts_available
         and (deliverable == "company_targeting"
              or (deliverable is None
-                 and "Priority Company Ranking" in result))
+                 and ("Priority Company Ranking" in result
+                      or "Target Companies and Investment Thesis Matrix"
+                      in result)))
     ):
         result, added = _ensure_expansion_block(result, db_context)
         if added:

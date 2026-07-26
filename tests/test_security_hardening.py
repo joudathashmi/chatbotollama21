@@ -119,18 +119,20 @@ def test_validate_security_config_flags_open_cors_in_production(monkeypatch):
     assert any("CORS" in e for e in errs)
 
 
-def test_chat_history_rejects_html_markup():
-    tok = _token(ADMIN_USER, ADMIN_PASS)
-    r = client.post(
-        "/api/v1/chat",
-        headers=_bearer(tok),
-        json={
-            "question": "hello",
-            "stream": False,
-            "history": [{"role": "user", "content": "<script>alert(1)</script>"}],
-        },
+def test_chat_history_strips_html_markup():
+    """History HTML is STRIPPED, not rejected — the chat UI re-sends
+    citation markup (<sup class="cite">) from prior answers, and a 422
+    here broke every follow-up after a web-cited answer. Script payloads
+    must be neutralised to plain text at the schema boundary."""
+    from app.schemas.chat import ChatRequest
+    req = ChatRequest(
+        question="hello",
+        stream=False,
+        history=[{"role": "user", "content": "<script>alert(1)</script>"}],
     )
-    assert r.status_code == 422
+    content = req.history[0].content
+    assert "<script>" not in content
+    assert content == "alert(1)"
 
 
 def test_chat_question_max_length_enforced():

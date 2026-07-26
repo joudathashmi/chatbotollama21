@@ -276,7 +276,7 @@ def test_advisory_prompt_demands_full_report():
     assert "Overall Market Fit" in p
     assert "Tier 1" in p
     assert "Strategic Targeting Recommendations for MISA" in p
-    assert "1,200" in p  # length target, not a 150-word cap
+    assert "1,500" in p  # explicit length target, not a 150-word cap
     assert "Current MISA Footprint" in p
 
 
@@ -293,7 +293,7 @@ def test_engagement_plan_prompt_is_a_plan_not_an_assessment():
 
 def test_unknown_deliverable_falls_back_to_adaptive_structure():
     p = advisory_system_prompt("en", "nonsense_label")
-    assert "ADAPT" in p
+    assert "adaptive to the ask" in p
 
 
 def test_advisory_prompt_enforces_specificity():

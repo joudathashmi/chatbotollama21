@@ -848,7 +848,12 @@ def _neutralise_unreliable_regional_revenue(answer: str, records_blob: str) -> s
                 line,
             )
         out_lines.append(line)
-    return "\n".join(out_lines)
+    result = "\n".join(out_lines)
+    # splitlines/join drops a trailing newline — preserve it so an
+    # untouched answer round-trips byte-identical.
+    if answer.endswith("\n") and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 _ATTRIBUTION_LINE = (
