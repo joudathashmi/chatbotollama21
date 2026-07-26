@@ -96,16 +96,21 @@ def test_deep_profile_uses_determinism_kw():
     assert "temperature=0.2" not in src
 
 
-def test_response_cache_defaults_on():
+def test_response_cache_defaults_off_and_is_opt_in():
     import os
     from app.services import chat_engine as ce
-    # Default when env unset
+    # Default when env unset: OFF — determinism comes from temperature 0
+    # + seed; the cache is opt-in via MISA_RESPONSE_CACHE=true.
     prev = os.environ.pop("MISA_RESPONSE_CACHE", None)
     try:
+        enabled, ttl, _ = ce._response_cache_settings()
+        assert enabled is False
+        os.environ["MISA_RESPONSE_CACHE"] = "true"
         enabled, ttl, _ = ce._response_cache_settings()
         assert enabled is True
         assert ttl >= 60
     finally:
+        os.environ.pop("MISA_RESPONSE_CACHE", None)
         if prev is not None:
             os.environ["MISA_RESPONSE_CACHE"] = prev
 
