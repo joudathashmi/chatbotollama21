@@ -26,6 +26,7 @@ from app.schemas.documents import (
     IngestRequest,
     IngestResponse,
 )
+from app.services.document_classification import CONSENT_POLICY
 from app.services.document_ingest import DocumentIngestError, ingest_bytes, ingest_inbox
 from app.services.document_store import get_document_store
 from app.utils.error_handler import create_error_response
@@ -67,6 +68,8 @@ async def _read_bounded(upload: UploadFile, max_bytes: int) -> bytes:
 async def upload_document(
     file: UploadFile = File(...),
     visibility: Literal["private", "org"] = Form("private"),
+    classification: str = Form("public"),
+    consent: bool = Form(False),
     user: str = Depends(verify_credentials),
 ):
     if not config.DOCUMENTS_ENABLED:
@@ -81,6 +84,8 @@ async def upload_document(
             visibility=visibility,
             source="upload",
             content_type=file.content_type,
+            classification=classification,
+            consent=consent,
         )
         return _to_out(doc)
     except DocumentIngestError as e:
@@ -90,8 +95,19 @@ async def upload_document(
             "SCAN_UNAVAILABLE": 503,
             "UNSUPPORTED_TYPE": 415,
             "DISABLED": 503,
+            "CLASSIFIED_DOCUMENT": 403,
+            "CLASSIFIED_CONTENT": 403,
+            "CONSENT_REQUIRED": 428,
         }.get(e.code, 400)
         return _err(e.code, e.message, status, "/api/v1/documents/upload")
+
+
+@router.get(
+    "/consent-policy",
+    summary="Upload consent declaration shown before any document upload",
+)
+async def consent_policy():
+    return CONSENT_POLICY
 
 
 @router.post(

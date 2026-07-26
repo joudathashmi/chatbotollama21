@@ -131,11 +131,10 @@ def score_recommendation(item: dict[str, Any] | str) -> dict[str, Any]:
     """Return {ok, score, reasons} for a recommendation blob."""
     if isinstance(item, str):
         action = item
-        owner = next_step = justification = ""
+        next_step = justification = ""
         motion = ""
     else:
         action = str(item.get("action") or item.get("recommendation") or "")
-        owner = str(item.get("owner") or "")
         next_step = str(item.get("next_step") or "")
         justification = str(item.get("justification") or item.get("why") or "")
         motion = str(item.get("investment_motion") or "")

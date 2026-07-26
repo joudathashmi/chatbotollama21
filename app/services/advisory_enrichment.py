@@ -661,8 +661,8 @@ def _ensure_sector_deep_dive_scaffold(
             f"Saudi demand programme and a dated capability offer — not a "
             f"generic MoU.",
             "",
-            f"**MISA play.** Desk sprint on top accounts within 90 days; "
-            f"pair each with a Saudi counterpart and a LEAP / FII slot.",
+            "**MISA play.** Desk sprint on top accounts within 90 days; "
+            "pair each with a Saudi counterpart and a LEAP / FII slot.",
             "",
         ]
     return _inject_before_footer(answer, "\n".join(lines)), [

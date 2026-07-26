@@ -37,10 +37,12 @@ def _assert_standard_shape(body: dict, expected_status: int, expected_code: str 
         assert body["error"]["code"] == expected_code
 
 
-def test_401_unauthenticated_uses_standard_shape_and_preserves_www_authenticate():
+def test_401_unauthenticated_uses_standard_shape_and_preserves_www_authenticate(monkeypatch):
     """Auth failures advertise the Bearer scheme (WWW-Authenticate: Bearer)
     for JWT auth — the global handler must not swallow the header while
     restyling the body."""
+    from app import config
+    monkeypatch.setattr(config, "AUTH_DISABLED", False)
     app.dependency_overrides.pop(verify_credentials, None)
     try:
         r = client.get("/api/v1/questions")  # any authed route, no creds supplied

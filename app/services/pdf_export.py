@@ -405,7 +405,6 @@ def render_pdf(
     if structured:
         try:
             from app.schemas.quality_response import (
-                QualityResponse,
                 validate_quality_response,
             )
             model, errs = validate_quality_response(structured)

@@ -497,6 +497,20 @@ _CHAT_HTML = r"""<!doctype html>
     <input id="docFile" type="file" multiple accept=".pdf,.docx,.txt,.md,.markdown">
     <label for="docVis">Visibility</label>
     <select id="docVis"><option value="private">Private</option><option value="org">Org shared</option></select>
+    <div class="hint" style="margin-top:8px;">
+      Classification is checked automatically. Documents marked Restricted,
+      Secret, or Top Secret are rejected and never stored. Only Public
+      documents are processed.
+    </div>
+    <div id="docConsent" style="margin-top:10px; padding:10px; border:1px solid #e5e5e7; border-radius:10px; background:#fafafa;">
+      <strong style="font-size:12px;" id="docConsentTitle">Upload consent declaration</strong>
+      <p class="hint" id="docConsentPre" style="margin:6px 0;"></p>
+      <ul id="docConsentTerms" style="margin:0 0 8px 16px; padding:0; font-size:12px; color:#4a4a4f; line-height:1.45;"></ul>
+      <label style="display:flex; gap:6px; align-items:flex-start; font-size:12px; margin:0;">
+        <input type="checkbox" id="docConsentChk" style="margin-top:2px;">
+        <span>I confirm all of the above and consent to processing.</span>
+      </label>
+    </div>
     <div class="doc-actions">
       <button id="docUploadBtn" type="button">Upload</button>
       <button id="docIngestBtn" class="secondary" type="button">Ingest inbox</button>
@@ -1309,6 +1323,7 @@ async function loadDocLibrary() {
     setDocCount(0);
     return;
   }
+  loadConsentPolicy();
   const r = await authFetch('/api/v1/documents');
   if (!r.ok) {
     docList.innerHTML = '<li class="hint">Could not load documents.</li>';
@@ -1343,19 +1358,56 @@ docToggle.addEventListener('click', () => {
   setDocsOpen(!workspace.classList.contains('docs-open'));
 });
 docClose.addEventListener('click', () => setDocsOpen(false));
-document.getElementById('docUploadBtn').addEventListener('click', async () => {
+const docConsentChk = document.getElementById('docConsentChk');
+const docUploadBtn = document.getElementById('docUploadBtn');
+
+function refreshDocGate() {
+  docUploadBtn.disabled = !docConsentChk.checked;
+}
+docConsentChk.addEventListener('change', refreshDocGate);
+refreshDocGate();
+
+let consentPolicyLoaded = false;
+
+async function loadConsentPolicy() {
+  if (consentPolicyLoaded) return;
+  try {
+    const r = await authFetch('/api/v1/documents/consent-policy');
+    if (!r.ok) return;
+    consentPolicyLoaded = true;
+    const p = await r.json();
+    document.getElementById('docConsentTitle').textContent = p.title || 'Upload consent declaration';
+    document.getElementById('docConsentPre').textContent = p.preamble || '';
+    document.getElementById('docConsentTerms').innerHTML =
+      (p.terms || []).map(t => '<li>' + escapeHtml(t.text) + '</li>').join('');
+  } catch {}
+}
+
+docUploadBtn.addEventListener('click', async () => {
+  if (!docConsentChk.checked) {
+    setDocMsg('Please accept the consent declaration first.', false); return;
+  }
   const files = docFile.files;
   if (!files.length) { setDocMsg('Choose a file first.', false); return; }
-  let ok = 0, fail = 0;
+  let ok = 0; const errors = [];
   for (const f of files) {
     const fd = new FormData();
     fd.append('file', f);
     fd.append('visibility', docVis.value);
+    fd.append('consent', 'true');
     const r = await authFetch('/api/v1/documents/upload', {method: 'POST', body: fd});
-    if (r.ok) ok++; else fail++;
+    if (r.ok) { ok++; continue; }
+    let msg = 'upload failed';
+    try { msg = (await r.json()).error?.message || msg; } catch {}
+    errors.push(f.name + ': ' + msg);
   }
-  setDocMsg('Uploaded ' + ok + (fail ? ', failed ' + fail : ''), fail === 0);
+  setDocMsg(
+    'Uploaded ' + ok + (errors.length ? ' · ' + errors.join(' · ') : ''),
+    errors.length === 0
+  );
   docFile.value = '';
+  docConsentChk.checked = false;
+  refreshDocGate();
   loadDocLibrary();
 });
 document.getElementById('docIngestBtn').addEventListener('click', async () => {

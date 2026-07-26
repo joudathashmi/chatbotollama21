@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.services.style_guide import HEADERS, make_footer
+from app.services.style_guide import make_footer
 
 
 _FORBIDDEN_SECTION_HEADERS = (

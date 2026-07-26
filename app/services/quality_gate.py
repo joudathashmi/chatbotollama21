@@ -17,7 +17,6 @@ Bulletproof contract (see ``advisory_safety``):
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
 
 
 _ZERO_FACT_RE = re.compile(

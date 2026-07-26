@@ -15,7 +15,6 @@ from typing import Any
 from app.services.commentary import (
     _text,
     format_int,
-    format_revenue_usd,
 )
 from app.services.style_guide import HEADERS, format_count, format_currency, make_footer
 
@@ -387,8 +386,8 @@ def render_person_brief(
             f"expansion and a LEAP / FII calendar slot."
         )
     parts.append(
-        f"* Confirm counterpart ministries / agencies before the meeting "
-        f"(MCIT, SDAIA, MoH / NUPCO, or Energy as relevant)."
+        "* Confirm counterpart ministries / agencies before the meeting "
+        "(MCIT, SDAIA, MoH / NUPCO, or Energy as relevant)."
     )
     parts.append("")
     parts.append(make_footer(["executive records", "company_profiles"]))
@@ -1198,7 +1197,6 @@ def render_engagement_brief(
 
     notes = _text(mena.get("mena_notes")) or _text(row.get("mena_notes")) or ""
     notes_l = notes.lower()
-    history = _text(mena.get("history_in_mena")) or _text(row.get("history_in_mena")) or ""
     mena_ent = (_text(mena.get("companies_name_in_mena")) or _text(row.get("companies_name_in_mena")) or "").rstrip(",")
     ksa_ent = (_text(mena.get("companies_name_in_ksa")) or _text(row.get("companies_name_in_ksa")) or "").rstrip(",")
     coverage = _text(rhq.get("rhq_country_coverage")) or ""
@@ -1256,14 +1254,14 @@ def render_engagement_brief(
         )
     if has_academy:
         why.append(
-            f"* The Riyadh-based Apple Developer Academy is a platform to deepen "
-            f"Saudi talent development in software and app ecosystems, aligning "
-            f"with digital-economy goals."
+            "* The Riyadh-based Apple Developer Academy is a platform to deepen "
+            "Saudi talent development in software and app ecosystems, aligning "
+            "with digital-economy goals."
             if "apple" in name.lower()
             else
-            f"* The on-file Developer Academy / digital-skills presence is a "
-            f"platform to deepen Saudi talent development and align with "
-            f"digital-economy goals."
+            "* The on-file Developer Academy / digital-skills presence is a "
+            "platform to deepen Saudi talent development and align with "
+            "digital-economy goals."
         )
     why.append(
         f"* **{name}**'s global scale in **{sector}** can attract complementary "
@@ -1307,8 +1305,8 @@ def render_engagement_brief(
             f"expanding the Saudi distribution hub."
         )
     risks.append(
-        f"* Validate appetite for deeper local manufacturing, assembly, or "
-        f"services partnerships beyond distribution."
+        "* Validate appetite for deeper local manufacturing, assembly, or "
+        "services partnerships beyond distribution."
     )
     if rhq_license and rhq_license.lower() == "inactive":
         risks.append(
@@ -1348,7 +1346,7 @@ def render_engagement_brief(
             rhq_line += f" (**{rhq_license}** license)"
         mena_pos.append(rhq_line + ".")
     if ksa_ent or ksa_emp is not None:
-        line = f"* Presence in Saudi Arabia"
+        line = "* Presence in Saudi Arabia"
         if ksa_ent:
             line += f" as **{ksa_ent}**"
         if ksa_emp is not None and format_int(ksa_emp):
@@ -1382,9 +1380,9 @@ def render_engagement_brief(
     strat: list[str] = []
     if has_hub:
         strat.append(
-            f"* The regional distribution hub in Saudi Arabia's logistics zone "
-            f"is a critical supply-chain node that can pull ancillary technology "
-            f"and logistics firms into the Kingdom."
+            "* The regional distribution hub in Saudi Arabia's logistics zone "
+            "is a critical supply-chain node that can pull ancillary technology "
+            "and logistics firms into the Kingdom."
         )
     if has_academy:
         strat.append(
@@ -1451,10 +1449,10 @@ def render_engagement_brief(
         "",
         f"* Schedule a 90-day account review with **{name}** leadership "
         f"against {_sector_demand_anchor(sector)}.",
-        f"* Table a written RHQ / localisation offer — not a generic "
-        f"partnership pitch.",
-        f"* Align IPA / chamber counterparts in the home market for a "
-        f"joint mission slot (LEAP / FII).",
+        "* Table a written RHQ / localisation offer — not a generic "
+        "partnership pitch.",
+        "* Align IPA / chamber counterparts in the home market for a "
+        "joint mission slot (LEAP / FII).",
         "",
         make_footer(["company_profiles", "company_executives", "opportunities"]),
     ]

@@ -84,7 +84,7 @@ def test_upload_and_list():
         "/api/v1/documents/upload",
         headers=_bearer(tok),
         files={"file": (name, data, "text/plain")},
-        data={"visibility": "private"},
+        data={"visibility": "private", "consent": "true"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -104,13 +104,13 @@ def test_duplicate_hash_returns_existing():
         "/api/v1/documents/upload",
         headers=_bearer(tok),
         files={"file": (name, data, "text/plain")},
-        data={"visibility": "private"},
+        data={"visibility": "private", "consent": "true"},
     )
     r2 = client.post(
         "/api/v1/documents/upload",
         headers=_bearer(tok),
         files={"file": (name, data, "text/plain")},
-        data={"visibility": "private"},
+        data={"visibility": "private", "consent": "true"},
     )
     assert r1.status_code == 200 and r2.status_code == 200
     assert r1.json()["id"] == r2.json()["id"]
@@ -124,7 +124,7 @@ def test_private_visibility_hidden_from_other_user():
         "/api/v1/documents/upload",
         headers=_bearer(alice),
         files={"file": (name, data, "text/plain")},
-        data={"visibility": "private"},
+        data={"visibility": "private", "consent": "true"},
     )
     assert up.status_code == 200
     doc_id = up.json()["id"]
@@ -144,7 +144,7 @@ def test_org_visibility_visible_to_peers():
         "/api/v1/documents/upload",
         headers=_bearer(alice),
         files={"file": (name, data, "text/plain")},
-        data={"visibility": "org"},
+        data={"visibility": "org", "consent": "true"},
     )
     assert up.status_code == 200
     doc_id = up.json()["id"]
@@ -185,7 +185,7 @@ def test_malware_reject(monkeypatch):
         "/api/v1/documents/upload",
         headers=_bearer(tok),
         files={"file": ("bad.txt", b"X5O!P%@AP", "text/plain")},
-        data={"visibility": "private"},
+        data={"visibility": "private", "consent": "true"},
     )
     assert r.status_code == 422
 
@@ -198,7 +198,7 @@ def test_chat_hybrid_includes_document_and_web(monkeypatch):
         "QuantumLeap Industries announced a major semiconductor investment in NEOM."
     )
     doc = di.ingest_bytes(
-        data, filename=name, owner_username=ALICE, visibility="org", source="upload"
+        data, filename=name, owner_username=ALICE, visibility="org", source="upload", consent=True
     )
     assert doc.status == "ready"
 
@@ -234,7 +234,7 @@ def test_chat_docs_only_override_skips_web(monkeypatch):
         "Helios Energy signed an MoU with MISA covering green hydrogen in 2023."
     )
     di.ingest_bytes(
-        data, filename=name, owner_username=ALICE, visibility="org", source="upload"
+        data, filename=name, owner_username=ALICE, visibility="org", source="upload", consent=True
     )
     set_audit_user(ALICE)
     with patch("app.services.chat_engine.get_openai_client", return_value=object()):
@@ -260,7 +260,7 @@ def test_chat_docs_first_mode_skips_web(monkeypatch):
         "QuantumLeap Industries announced a major semiconductor investment in NEOM."
     )
     di.ingest_bytes(
-        data, filename=name, owner_username=ALICE, visibility="org", source="upload"
+        data, filename=name, owner_username=ALICE, visibility="org", source="upload", consent=True
     )
     set_audit_user(ALICE)
     with patch("app.services.chat_engine.get_openai_client", return_value=object()):

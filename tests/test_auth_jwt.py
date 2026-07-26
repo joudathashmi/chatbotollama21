@@ -48,6 +48,9 @@ def _jwt_env(monkeypatch):
     monkeypatch.setattr(config, "API_USERNAME", BOOT_USER)
     monkeypatch.setattr(config, "API_PASSWORD", BOOT_PASS)
     monkeypatch.setattr(config, "ALLOW_PLAINTEXT_BOOTSTRAP", True)
+    # Real token validation must run even when the local .env demos with
+    # MISA_AUTH_DISABLED=true.
+    monkeypatch.setattr(config, "AUTH_DISABLED", False)
     monkeypatch.setattr(config, "BOOTSTRAP_ROLE", config.ROLE_ADMIN)
     alice_hash = bcrypt.hashpw(ALICE_PASS.encode(), bcrypt.gensalt()).decode()
     monkeypatch.setattr(config, "AUTH_USERS", {ALICE_USER: alice_hash})

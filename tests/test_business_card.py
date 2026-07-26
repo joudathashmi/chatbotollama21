@@ -1275,11 +1275,13 @@ class TestBusinessCardScanStatusEndpoint:
         assert data["available"] is True
         assert "ClamAV" in data["detail"]
 
-    def test_status_requires_auth(self):
+    def test_status_requires_auth(self, monkeypatch):
         """conftest overrides verify_credentials for the whole suite —
         pop it briefly to confirm the endpoint actually enforces auth
         when that override isn't present."""
+        from app import config
         from app.auth import verify_credentials
+        monkeypatch.setattr(config, "AUTH_DISABLED", False)
         app.dependency_overrides.pop(verify_credentials, None)
         try:
             r = client.get("/api/v1/business-card/scan-status")

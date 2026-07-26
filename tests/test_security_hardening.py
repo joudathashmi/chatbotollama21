@@ -26,6 +26,7 @@ def _sec_env(monkeypatch):
     monkeypatch.setattr(config, "JWT_ISSUER", "misa-intelligence-api")
     monkeypatch.setattr(config, "JWT_AUDIENCE", "misa-intelligence-api")
     monkeypatch.setattr(config, "ALLOW_PLAINTEXT_BOOTSTRAP", False)
+    monkeypatch.setattr(config, "AUTH_DISABLED", False)
     monkeypatch.setattr(config, "API_USERNAME", "")
     monkeypatch.setattr(config, "API_PASSWORD", "")
 

@@ -787,7 +787,7 @@ def test_india_footprint_not_false_zero():
         (r.get("company_name") or "") for r in (stats.get("rhq") or [])
     ).lower()
     # At least some known Indian RHQ footprint should appear in rhq or licensed.
-    all_names = names + " " + " ".join(
+    names += " " + " ".join(
         (r.get("company_name") or "") for r in (stats.get("licensed_only") or [])
     ).lower()
     assert int(stats.get("total_licensed") or 0) > 0

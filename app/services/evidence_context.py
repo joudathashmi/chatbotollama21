@@ -7,7 +7,7 @@ source metadata and a retrieval status.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 

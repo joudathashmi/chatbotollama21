@@ -17,6 +17,12 @@ from app.services.document_store import (
     sha256_bytes,
     storage_path_for,
 )
+from app.services.document_classification import (
+    CLASSIFICATION_LEVELS,
+    CLASSIFICATION_PUBLIC,
+    find_classification_marking,
+    normalize_classification,
+)
 from app.services.malware_scanner import ScanVerdict, scan_file
 
 ALLOWED_EXTENSIONS = {
@@ -101,6 +107,74 @@ def chunk_text(text: str, *, size: int = 1000, overlap: int = 120) -> list[str]:
     return chunks
 
 
+# Custom-property names used by document classifier tools to store the label.
+_LABEL_PROPERTY_RE = re.compile(
+    r"(?i)(securitylabel|classification|sensitivity|msip_label.*_name|bjdocumentlabel)"
+)
+
+
+def _deep_scan_text(data: bytes, filename: str) -> str:
+    """Text the classification screen must see beyond body paragraphs.
+
+    Protective markings are frequently NOT in the body text: classifier
+    tools such as Boldon James stamp them into document properties
+    (bjDocumentSecurityLabel), header/footer text boxes, and watermarks.
+    For DOCX this walks the raw OOXML parts (docProps, headers, footers,
+    document body, comments, custom XML) collecting every text node and
+    attribute value. For PDF it adds the metadata dictionary. Returns ""
+    on any parse failure."""
+    ext = Path(filename).suffix.lower()
+    parts: list[str] = []
+    if ext == ".docx":
+        try:
+            import zipfile
+            from xml.etree import ElementTree
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for name in zf.namelist():
+                    if not name.endswith(".xml"):
+                        continue
+                    if not (
+                        name.startswith("docProps/")
+                        or name.startswith("word/")
+                        or name.startswith("customXml/")
+                    ):
+                        continue
+                    try:
+                        root = ElementTree.fromstring(zf.read(name))
+                    except ElementTree.ParseError:
+                        continue
+                    parts.extend(t for t in root.itertext() if t and t.strip())
+                    for el in root.iter():
+                        parts.extend(v for v in el.attrib.values() if v and v.strip())
+                        # Classifier tools (Boldon James, Microsoft Purview/AIP)
+                        # store the label in named custom properties, e.g.
+                        # bjDocumentSecurityLabel="Restricted / مقيد" or
+                        # MSIP_Label_<guid>_Name="Confidential". Surface those
+                        # values as explicit "classification:" lines so mixed
+                        # case labels are caught.
+                        prop_name = el.attrib.get("name", "")
+                        if _LABEL_PROPERTY_RE.search(prop_name):
+                            value = "".join(el.itertext()).strip()
+                            if value:
+                                parts.append(f"classification: {value}")
+        except Exception:
+            return ""
+    elif ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            meta = reader.metadata or {}
+            for key, value in meta.items():
+                if not value:
+                    continue
+                parts.append(str(value))
+                if _LABEL_PROPERTY_RE.search(str(key)):
+                    parts.append(f"classification: {value}")
+        except Exception:
+            return ""
+    return "\n" + "\n".join(parts) if parts else ""
+
+
 def _malware_check(data: bytes, filename: str) -> None:
     result = scan_file(data, filename=filename)
     if result.verdict == ScanVerdict.INFECTED:
@@ -117,12 +191,44 @@ def ingest_bytes(
     visibility: str = "private",
     source: str = "upload",
     content_type: str | None = None,
+    classification: str = CLASSIFICATION_PUBLIC,
+    consent: bool = False,
 ) -> DocumentRecord:
-    """Validate, store, extract, chunk, and index a document. Returns the record."""
+    """Validate, store, extract, chunk, and index a document. Returns the record.
+
+    Only Public documents are accepted: a declared Restricted/Secret/Top Secret
+    label is rejected up front, and extracted text is screened for protective
+    markings before anything is stored or indexed. `consent` records that the
+    uploader accepted the upload consent declaration.
+    """
     if not config.DOCUMENTS_ENABLED:
         raise DocumentIngestError("DISABLED", "Document library is disabled.")
     if visibility not in ("private", "org"):
         raise DocumentIngestError("BAD_VISIBILITY", "visibility must be private or org.")
+
+    level = normalize_classification(classification)
+    if level != CLASSIFICATION_PUBLIC:
+        if level in CLASSIFICATION_LEVELS:
+            logger.warning(
+                f"document upload rejected: declared classification={level} "
+                f"user={owner_username} filename={filename!r}"
+            )
+            raise DocumentIngestError(
+                "CLASSIFIED_DOCUMENT",
+                "Only Public documents may be uploaded. Restricted, Secret, and "
+                "Top Secret documents cannot be uploaded or processed.",
+            )
+        raise DocumentIngestError(
+            "BAD_CLASSIFICATION",
+            "classification must be one of: public, restricted, secret, top_secret.",
+        )
+    if not consent:
+        raise DocumentIngestError(
+            "CONSENT_REQUIRED",
+            "The upload consent declaration must be accepted before a document "
+            "can be processed.",
+        )
+
     if len(data) > config.DOCUMENTS_MAX_BYTES:
         raise DocumentIngestError("FILE_TOO_LARGE", "File exceeds maximum allowed size.")
     if not data:
@@ -131,6 +237,29 @@ def ingest_bytes(
     fname = safe_filename(filename)
     ctype = guess_content_type(fname, content_type)
     _malware_check(data, fname)
+
+    # Screen content for protective markings BEFORE storing anything, so a
+    # marked document never touches disk or the index.
+    try:
+        marking_text = extract_text(data, fname)
+    except DocumentIngestError:
+        marking_text = ""
+    marking_text += _deep_scan_text(data, fname)
+    marking = find_classification_marking(marking_text, fname)
+    if marking:
+        logger.warning(
+            f"document upload rejected: {marking} user={owner_username} "
+            f"filename={filename!r}"
+        )
+        raise DocumentIngestError(
+            "CLASSIFIED_CONTENT",
+            "Upload rejected: the document carries a protective marking "
+            f"({marking}). Only Public documents may be processed.",
+        )
+    logger.info(
+        f"document upload consent recorded: user={owner_username} "
+        f"filename={fname!r} classification=public consent=true"
+    )
 
     digest = sha256_bytes(data)
     store = get_document_store()
@@ -216,12 +345,15 @@ def ingest_inbox(
                 results["duplicates"].append({"filename": path.name, "id": dup.id})
                 shutil.move(str(path), str(processed / path.name))
                 continue
+            # Operator-driven inbox ingest carries implicit operator consent;
+            # the protective-marking screen still applies to every file.
             doc = ingest_bytes(
                 data,
                 filename=path.name,
                 owner_username=owner_username,
                 visibility=visibility,
                 source="ingest",
+                consent=True,
             )
             results["ingested"].append(doc.to_dict())
             shutil.move(str(path), str(processed / path.name))

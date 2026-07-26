@@ -189,7 +189,7 @@ def test_system_case(case: dict):
         )
         assert repaired and len(repaired) > 80
         assert "Executive Briefing" in repaired or rfixes or "Strategic" in repaired
-        viol = soft_check_answer(
+        soft_check_answer(
             out, intent="company_profile", user_question=q,
         )
         # After enrich, company shape should be close; allow Strategic Context path

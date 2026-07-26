@@ -107,7 +107,7 @@ def render_docx(
 
 def _append_markdown_tables(doc, text: str) -> None:
     try:
-        from docx.shared import Pt
+        from docx.shared import Pt  # noqa: F401 — availability probe
     except ImportError:
         return
     lines = (text or "").splitlines()

@@ -6,7 +6,7 @@ behaviour — if chat can gate on DB counts, export must too.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 
 def quality_context_for_question(
