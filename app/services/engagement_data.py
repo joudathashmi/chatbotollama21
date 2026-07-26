@@ -31,6 +31,8 @@ that the curator can serialise directly into the LLM prompt.
 from __future__ import annotations
 
 
+import logging
+
 import psycopg2.extras
 
 from app.database import get_db
@@ -70,6 +72,15 @@ _LEGACY_LICENSED = f"{LICENSED_ENTITY} AND {ACTIVE_CLAUSE}"
 _LEGACY_RHQ = (
     f"{LICENSED_ENTITY} AND registration_type = 'RHQ' AND {ACTIVE_CLAUSE}"
 )
+
+
+def _table_exists(cur, table: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name = %s LIMIT 1",
+        (table,),
+    )
+    return cur.fetchone() is not None
 
 
 def _column_exists(cur, table: str, column: str) -> bool:
@@ -866,6 +877,50 @@ def fetch_country_profile_bundle(country_name: str) -> dict:
 
 
 # ─── Saudi licensing aggregate (for "how many RHQ / licensed?") ────
+
+def fetch_rhq_license_holders(limit: int = 15) -> list[dict]:
+    """Top RHQ license holders (name / industry / revenue), revenue-ranked.
+
+    Backs the deterministic 'which companies hold an RHQ license' list
+    answer. Prefers rhq_company.rhq_license_status (the canonical license
+    list; columns sector / revenue_usd) and falls back to
+    company_profiles.is_rhq when absent."""
+    n = max(1, min(limit, 50))
+
+    def _order(col: str) -> str:
+        return (f"ORDER BY NULLIF(regexp_replace({col}::text, "
+                f"'[^0-9.]', '', 'g'), '')::numeric DESC NULLS LAST")
+
+    try:
+        conn = get_db()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if (_table_exists(cur, "rhq_company")
+                    and _column_exists(cur, "rhq_company",
+                                       "rhq_license_status")):
+                cur.execute(
+                    "SELECT company_name, sector AS industry, "
+                    "revenue_usd AS annual_revenue "
+                    "FROM rhq_company WHERE rhq_license_status IS NOT NULL "
+                    "AND LOWER(rhq_license_status::text) IN "
+                    "('true', 't', 'yes', 'active', '1') "
+                    + _order("revenue_usd") + " LIMIT %s",
+                    (n,),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+                if rows:
+                    return rows
+            cur.execute(
+                "SELECT company_name, industry, annual_revenue "
+                "FROM company_profiles WHERE is_rhq IS TRUE "
+                + _order("annual_revenue") + " LIMIT %s",
+                (n,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"fetch_rhq_license_holders failed: {e}")
+        return []
+
 
 def fetch_saudi_licensing_summary() -> dict:
     """Aggregate totals + breakdown for Saudi-licensing counts.

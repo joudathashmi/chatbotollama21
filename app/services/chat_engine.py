@@ -2875,13 +2875,29 @@ _SAUDI_LICENSING_COUNT_RE = re.compile(
 )
 
 
+# "which companies hold an RHQ license", "show me the MISA license
+# holders", "who is licensed by MISA" — a request to LIST license
+# holders (no origin country). Routed to the deterministic licensing
+# briefing with a holders table instead of entity smart-search (which
+# has no entity to match and used to fall through to general knowledge).
+_SAUDI_LICENSE_LIST_RE = re.compile(
+    r"\b(which|list|show(?:\s+me)?|who|name)\b"
+    r".{0,60}\b(rhq\s+licen[cs]e|licen[cs]e\s+holders?|"
+    r"licen[cs]ed\s+by\s+misa|misa\s+licen[cs]e|hold\w*\s+an?\s+rhq)",
+    re.IGNORECASE,
+)
+
+
 def _is_saudi_licensing_count_question(question: str) -> bool:
     q = question or ""
-    if not _SAUDI_LICENSING_COUNT_RE.search(q):
+    if not (
+        _SAUDI_LICENSING_COUNT_RE.search(q)
+        or _SAUDI_LICENSE_LIST_RE.search(q)
+    ):
         return False
     # Keep country company-list asks on their own path
     # ("tell me the Indian active companies").
-    if _is_country_company_list_question(q):
+    if _is_country_company_list_question(q) and _detect_origin_country(q):
         return False
     return True
 
@@ -5312,6 +5328,36 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
             summary = fetch_saudi_licensing_summary()
             answer = _format_saudi_licensing_briefing(
                 summary, focus=_licensing_question_focus(user_question))
+            # List asks ("which companies hold an RHQ license") get the
+            # actual holder table, revenue-ranked, appended to the counts.
+            if _SAUDI_LICENSE_LIST_RE.search(user_question or ""):
+                from app.services.engagement_data import (
+                    fetch_rhq_license_holders,
+                )
+                holders = fetch_rhq_license_holders(limit=15)
+                if holders:
+                    lines = [
+                        "", "## RHQ License Holders (top by revenue)", "",
+                        "| Company Name | Industry | Annual Revenue (USD) |",
+                        "|---|---|---|",
+                    ]
+                    for h in holders:
+                        rev = h.get("annual_revenue")
+                        try:
+                            rev = f"{float(rev):,.0f}" if rev else "N/A"
+                        except (TypeError, ValueError):
+                            rev = "N/A"
+                        lines.append(
+                            f"| {(h.get('company_name') or '—')} "
+                            f"| {(h.get('industry') or 'Unclassified')} "
+                            f"| {rev} |"
+                        )
+                    lines.append("")
+                    lines.append(
+                        "_Sources: `rhq_company.rhq_license_status` / "
+                        "`company_profiles.is_rhq`._"
+                    )
+                    answer = answer.rstrip() + "\n" + "\n".join(lines)
             pack["_saudi_licensing_count"] = True
             pack["_retrieval"] = summary.get("retrieval")
             try:
