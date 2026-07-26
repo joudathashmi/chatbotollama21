@@ -6532,23 +6532,26 @@ def build_debug_payload(user_question: str, result: dict) -> dict:
     return debug
 
 
-# ─── Response cache ───────────────────────────────────────────────────
+# ─── Response cache (OPT-IN) ──────────────────────────────────────────
 # Even at temperature 0 + fixed seed, OpenAI is only best-effort
 # deterministic, so the SAME question can still reword slightly between
 # runs. This cache returns the byte-identical answer for a repeated
 # single-turn question within the TTL.
 #
-# DEFAULT ON for demo consistency: same single-turn question returns the
-# byte-identical prior answer within TTL. Disable with MISA_RESPONSE_CACHE=false
-# when you need every run to re-hit Azure (e.g. quality A/B). Structure is
-# still contract-locked even with the cache off.
+# DEFAULT OFF. The determinism controls (temperature 0 + seed) already
+# give strong consistency without side effects. The cache adds two
+# risks not worth carrying by default: (1) it freezes whatever the
+# first answer was — a one-off weak answer would be served for the
+# whole TTL; (2) it makes the quality/regression batteries flaky by
+# serving stale answers. Enable with MISA_RESPONSE_CACHE=true when
+# byte-identical repeats matter and the staleness tradeoff is accepted.
 _RESPONSE_CACHE: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
 _RESPONSE_CACHE_LOCK = Lock()
 
 
 def _response_cache_settings() -> tuple[bool, int, int]:
     import os
-    enabled = (os.getenv("MISA_RESPONSE_CACHE", "true") or "").strip().lower() \
+    enabled = (os.getenv("MISA_RESPONSE_CACHE", "false") or "").strip().lower() \
         in ("1", "true", "yes", "on")
     try:
         ttl = int(os.getenv("MISA_RESPONSE_CACHE_TTL", "900") or "900")
