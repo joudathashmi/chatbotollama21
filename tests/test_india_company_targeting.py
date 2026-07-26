@@ -198,7 +198,7 @@ def test_structured_payload_requires_investment_and_separates_types():
     assert "expansion" in md and "new_entry" in md
     assert "Cloud delivery centre" in md
     assert "Tech Mahindra" in md
-    assert "Sources and Data Limitations" in md
+    assert "Strategic analysis synthesised from market knowledge" in md
     assert "2438" in md
     # Ranking must be complete (not truncated mid-row)
     assert ranking_table_is_truncated(md) is False
@@ -241,7 +241,7 @@ def test_validator_rebuilds_truncated_ranking_table():
     fixed, fixes = validate_advisory_answer(truncated, ctx)
     assert "rebuilt_truncated_company_targeting_from_db" in fixes
     assert "Tech Mahindra" in fixed
-    assert "Detailed Investment Theses" in fixed
+    assert "Target Companies and Investment Thesis Matrix" in fixed
     assert ranking_table_is_truncated(fixed) is False
 
 

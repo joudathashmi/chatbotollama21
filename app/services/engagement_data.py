@@ -663,7 +663,7 @@ def fetch_country_saudi_investors(country_name: str) -> dict:
                 FROM company_profiles
                 WHERE {_origin_filter}
                   AND {rhq_sql}
-                ORDER BY annual_revenue DESC NULLS LAST
+                ORDER BY NULLIF(regexp_replace(annual_revenue::text, '[^0-9.]', '', 'g'), '')::numeric DESC NULLS LAST
                 LIMIT 15
             """, _origin_params)
             out["rhq"] = [dict(r) for r in cur.fetchall()]
@@ -674,7 +674,7 @@ def fetch_country_saudi_investors(country_name: str) -> dict:
                 WHERE {_origin_filter}
                   AND {lic_sql}
                   AND NOT ({rhq_sql})
-                ORDER BY annual_revenue DESC NULLS LAST
+                ORDER BY NULLIF(regexp_replace(annual_revenue::text, '[^0-9.]', '', 'g'), '')::numeric DESC NULLS LAST
                 LIMIT 15
             """, _origin_params)
             out["licensed_only"] = [dict(r) for r in cur.fetchall()]
@@ -699,7 +699,7 @@ def fetch_country_saudi_investors(country_name: str) -> dict:
                        employee_count, industry, founded, ceo, role
                 FROM company_profiles
                 WHERE {hq_filter} AND {non_lic_sql}
-                ORDER BY annual_revenue DESC NULLS LAST LIMIT 10
+                ORDER BY NULLIF(regexp_replace(annual_revenue::text, '[^0-9.]', '', 'g'), '')::numeric DESC NULLS LAST LIMIT 10
             """, hq_params)
             out["non_licensed"] = [dict(r) for r in cur.fetchall()]
     except Exception as exc:

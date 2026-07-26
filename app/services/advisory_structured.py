@@ -244,40 +244,51 @@ def extract_json_object(text: str) -> dict | None:
         return None
 
 
+# Origin-country → demonym for headings ("Top Indian RHQ Companies …").
+_COUNTRY_ADJECTIVES = {
+    "india": "Indian", "china": "Chinese", "japan": "Japanese",
+    "germany": "German", "france": "French", "italy": "Italian",
+    "spain": "Spanish", "turkey": "Turkish", "egypt": "Egyptian",
+    "pakistan": "Pakistani", "brazil": "Brazilian", "russia": "Russian",
+    "canada": "Canadian", "australia": "Australian", "korea": "Korean",
+    "south korea": "South Korean", "netherlands": "Dutch",
+    "switzerland": "Swiss", "sweden": "Swedish", "norway": "Norwegian",
+    "denmark": "Danish", "greece": "Greek", "poland": "Polish",
+    "portugal": "Portuguese", "mexico": "Mexican", "argentina": "Argentine",
+    "indonesia": "Indonesian", "malaysia": "Malaysian",
+    "singapore": "Singaporean", "thailand": "Thai", "vietnam": "Vietnamese",
+    "philippines": "Philippine", "united states": "American",
+    "usa": "American", "united kingdom": "British", "uk": "British",
+    "ireland": "Irish", "austria": "Austrian", "belgium": "Belgian",
+    "finland": "Finnish", "hungary": "Hungarian", "romania": "Romanian",
+    "ukraine": "Ukrainian", "south africa": "South African",
+    "nigeria": "Nigerian", "kenya": "Kenyan", "morocco": "Moroccan",
+    "jordan": "Jordanian", "lebanon": "Lebanese", "kuwait": "Kuwaiti",
+    "qatar": "Qatari", "bahrain": "Bahraini", "oman": "Omani",
+    "united arab emirates": "Emirati", "uae": "Emirati",
+}
+
+
+def origin_adjective(country: str) -> str:
+    c = (country or "").strip()
+    return _COUNTRY_ADJECTIVES.get(c.lower(), c)
+
+
 def render_company_targeting_markdown(payload: dict) -> str:
-    """Chat-facing markdown from a validated payload."""
+    """Chat-facing markdown from a validated payload — the MISA
+    Intelligence Briefing shape: Strategic Context, Current MISA
+    Footprint, Top RHQ / Top Licensed tables, Investment & Trade Bodies
+    to Engage, Target Companies and Investment Thesis Matrix,
+    Recommendations to MISA, closing attribution line."""
     fp = payload["current_footprint"]
     lines: list[str] = [f"# {payload['title']}", ""]
     if payload.get("_truncated"):
         lines += [
             "> **Partial result:** thesis enrichment was truncated; "
-            "ranking below is DB-seeded and complete, but some thesis "
-            "text may be thinner than usual.",
+            "the tables below are DB-seeded and complete, but some "
+            "thesis text may be thinner than usual.",
             "",
         ]
-
-    lines.append("## Executive Summary")
-    findings = payload["executive_summary"].get("key_findings") or []
-    if fp.get("licensed_companies") is not None:
-        findings = [
-            f"MISA database: **{fp['licensed_companies']}** licensed companies "
-            f"from this origin; **{fp.get('rhq_companies') or 0}** with RHQ "
-            f"status (retrieval: {fp.get('retrieval_status')})."
-        ] + [f for f in findings if "licensed" not in f.lower()]
-    for f in findings[:6]:
-        lines.append(f"- {f}")
-    if payload["executive_summary"].get("top_recommendation"):
-        lines.append(
-            f"- **Top recommendation:** "
-            f"{payload['executive_summary']['top_recommendation']}"
-        )
-    exp_n = sum(1 for t in payload["targets"] if t["target_type"] == "expansion")
-    new_n = sum(1 for t in payload["targets"] if t["target_type"] == "new_entry")
-    lines.append(
-        f"- Priority list split: **{exp_n}** expansion targets and "
-        f"**{new_n}** new-entry targets."
-    )
-    lines.append("")
 
     # Strategic Context — old Jul21 briefs always led with this framing.
     strat = (payload.get("strategic_context") or "").strip()
@@ -321,23 +332,39 @@ def render_company_targeting_markdown(payload: dict) -> str:
             f"(source: {fp.get('source') or 'MISA database'})."
         )
     else:
+        country = _str(fp.get("origin_country"), "this origin")
         lines.append(
-            f"According to MISA's database (**{fp.get('source')}**; "
-            f"retrieval `{status}`), **{fp['licensed_companies']}** "
-            f"companies from this origin are licensed in Saudi Arabia, "
-            f"of which **{fp.get('rhq_companies') or 0}** hold RHQ status."
+            f"According to MISA's database, **{fp['licensed_companies']}** "
+            f"companies from {country} are licensed in Saudi Arabia, of "
+            f"which **{fp.get('rhq_companies') or 0}** hold Regional "
+            f"Headquarters (RHQ) status."
         )
-        leads = fp.get("leading_companies") or []
-        if leads:
-            lines.append("Leading companies in the footprint: " + ", ".join(leads) + ".")
-    for lim in fp.get("limitations") or []:
-        lines.append(f"- Limitation: {lim}")
+        rhq_names = [r["name"] for r in fp.get("top_rhq_rows") or []][:5]
+        lic_names = [r["name"] for r in fp.get("top_licensed_rows") or []][:5]
+        if rhq_names:
+            lines.append("")
+            lines.append("Top RHQ holders: " + ", ".join(rhq_names) + ".")
+        if lic_names:
+            lines.append("")
+            lines.append(
+                "Top licensed companies: " + ", ".join(lic_names) + "."
+            )
+        if not rhq_names and not lic_names:
+            leads = fp.get("leading_companies") or []
+            if leads:
+                lines.append(
+                    "Leading companies in the footprint: "
+                    + ", ".join(leads) + "."
+                )
+    if status not in ("ok", "SUCCESS_WITH_RESULTS", None, ""):
+        for lim in fp.get("limitations") or []:
+            lines.append(f"- Limitation: {lim}")
     lines.append("")
 
     # PDF-format footprint tables: Top RHQ + Top Licensed (Non-RHQ) with
     # industry / revenue / one-sentence thesis columns. Rows are assembled
     # in code so a token limit can never cut them mid-table.
-    origin = _str(fp.get("origin_country"), "Origin")
+    origin = origin_adjective(_str(fp.get("origin_country"), "Origin"))
     _theses_by_name = {
         (t.get("company") or "").strip().lower(): t
         for t in payload.get("targets") or []
@@ -393,85 +420,6 @@ def render_company_targeting_markdown(payload: dict) -> str:
         lines.append("")
         _footprint_table(lic_rows, "licensed")
 
-    lines.append("## Target Companies and Investment Thesis Matrix")
-    lines.append("")
-    lines.append(
-        "| Company Name | Sector | Saudi Sectoral Alignment | "
-        "Investment Thesis | Key Saudi Anchor(s) |"
-    )
-    lines.append("|---|---|---|---|---|")
-    for t in payload["targets"]:
-        fit = t.get("saudi_strategic_fit") or []
-        alignment = (fit[0] if fit else t["sector"]).replace("|", "/")
-        anchors = (
-            ", ".join(fit[1:3]) if len(fit) > 1 else "Vision 2030 programmes"
-        ).replace("|", "/")
-        thesis = (t.get("why_company") or "")[:110]
-        if t.get("why_saudi"):
-            thesis = (thesis + " " + t["why_saudi"])[:150]
-        thesis = thesis.replace("|", "/").replace("\n", " ")
-        row = [
-            t["company"].replace("|", "/"),
-            t["sector"].replace("|", "/"),
-            alignment,
-            thesis,
-            anchors,
-        ]
-        lines.append("| " + " | ".join(row) + " |")
-    lines.append("")
-
-    lines.append("## Detailed Investment Theses")
-    lines.append("")
-    for t in payload["targets"][:8]:
-        lines.append(f"### {t['company']}")
-        lines.append("")
-        why_c = t.get("why_company") or "Requires validation"
-        why_s = t.get("why_saudi") or "Requires validation"
-        why_n = t.get("why_now") or "Requires validation"
-        prop = t.get("proposed_investment") or "Requires validation"
-        action = t.get("misa_action") or "Requires validation"
-        # Jul21 narrative: short paragraphs, not one-line stubs.
-        lines.append(
-            f"**Target type:** {t['target_type']} · "
-            f"**Evidence strength:** {t.get('evidence_strength') or 'medium'}"
-        )
-        lines.append("")
-        lines.append(
-            f"**Why this company.** {why_c}"
-        )
-        lines.append("")
-        lines.append(
-            f"**Why Saudi Arabia.** {why_s}"
-        )
-        lines.append("")
-        lines.append(
-            f"**Why now.** {why_n}"
-        )
-        lines.append("")
-        lines.append(
-            f"**Proposed investment.** {prop}"
-        )
-        if t.get("saudi_strategic_fit"):
-            lines.append("")
-            lines.append(
-                "**Saudi strategic fit.** "
-                + "; ".join(t["saudi_strategic_fit"])
-            )
-        lines.append("")
-        lines.append(
-            f"**Recommended MISA action.** {action}"
-        )
-        if t.get("evidence"):
-            lines.append("")
-            lines.append("**Evidence.** " + "; ".join(t["evidence"]))
-        if t.get("validation_required"):
-            lines.append("")
-            lines.append(
-                "**Requires validation.** "
-                + "; ".join(t["validation_required"])
-            )
-        lines.append("")
-
     if payload.get("trade_bodies"):
         lines.append("## Investment & Trade Bodies to Engage")
         lines.append("")
@@ -488,43 +436,54 @@ def render_company_targeting_markdown(payload: dict) -> str:
             )
         lines.append("")
 
+    lines.append("## Target Companies and Investment Thesis Matrix")
+    lines.append("")
+    lines.append(
+        "| Company Name | Sector | Saudi Sectoral Alignment | "
+        "Investment Thesis | Key Saudi Anchor(s) |"
+    )
+    lines.append("|---|---|---|---|---|")
+    for t in payload["targets"]:
+        fit = t.get("saudi_strategic_fit") or []
+        alignment = (fit[0] if fit else t["sector"]).replace("|", "/")
+        anchors = (
+            ", ".join(fit[1:3]) if len(fit) > 1 else "Vision 2030 programmes"
+        ).replace("|", "/")
+        thesis = (
+            t.get("proposed_investment")
+            or (t.get("why_company") or "")
+        )[:130]
+        if t.get("target_type"):
+            thesis = f"{thesis} ({t['target_type']})"
+        thesis = thesis.replace("|", "/").replace("\n", " ")
+        row = [
+            t["company"].replace("|", "/"),
+            t["sector"].replace("|", "/"),
+            alignment,
+            thesis,
+            anchors,
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+    lines.append("")
+
     lines.append("## Recommendations to MISA")
-    # Prefer company-named actions (old Jul21 quality). Generic enrichment
-    # bullets without a company name are demoted.
+    # Payload recommendations are already ordered rich-first by
+    # merge_thesis_enrichment — render them as given.
     recs = [r for r in (payload.get("recommendations") or []) if r]
-    named = [r for r in recs if any(
-        (t.get("company") or "")[:12].lower() in r.lower()
-        for t in (payload.get("targets") or [])
-        if t.get("company")
-    )]
-    if not named:
-        named = [
-            f"Engage **{t['company']}** — {t['misa_action']}"
+    if not recs:
+        recs = [
+            f"**Engage {t['company']}** — {t['misa_action']}"
             for t in (payload.get("targets") or [])[:8]
             if t.get("misa_action")
         ]
-    for r in named[:10]:
+    for r in recs[:10]:
         lines.append(f"- {r}")
-    extras = [r for r in recs if r not in named][:4]
-    for r in extras:
-        lines.append(f"- {r}")
-    if not named and not extras:
+    if not recs:
         lines.append(
             "- Prioritise account reviews with the top RHQ holders above."
         )
     lines.append("")
 
-    lines.append("## Sources and Data Limitations")
-    lines.append("- **Internal MISA data:** footprint counts and expansion targets where retrieval_status is `ok` or `zero_records`.")
-    lines.append("- **Official / public data:** company sector and market context used in theses.")
-    lines.append("- **Analytical inference:** ranking judgements and 'why now' timing arguments.")
-    for s in payload.get("sources") or []:
-        if s:
-            lines.append(f"- {s}")
-    for lim in payload.get("data_limitations") or []:
-        lines.append(f"- Limitation: {lim}")
-    for lim in fp.get("limitations") or []:
-        lines.append(f"- Limitation: {lim}")
     lines.append("")
     lines.append(
         "*Strategic analysis synthesised from market knowledge; "
@@ -535,11 +494,16 @@ def render_company_targeting_markdown(payload: dict) -> str:
 
 def company_targeting_json_system_addon() -> str:
     return (
-        "Return ONLY a single compact JSON object (no markdown fences):\n"
+        "Return ONLY a single compact JSON object (no markdown fences). "
+        "EVERY key below is REQUIRED — a response without "
+        "'recommendations' or 'trade_bodies' is INVALID:\n"
         "{\n"
         '  "strategic_context": string,\n'
         '  "executive_summary": {"key_findings": [string], '
         '"top_recommendation": string},\n'
+        '  "recommendations": [string],\n'
+        '  "trade_bodies": [{"organisation": string, "type": string, '
+        '"role": string}],\n'
         '  "theses": {\n'
         '    "<ExactCompanyName>": {\n'
         '      "why_company": string, "why_saudi": string, "why_now": string,\n'
@@ -553,9 +517,6 @@ def company_targeting_json_system_addon() -> str:
         '"proposed_investment": string, "why_company": string, '
         '"why_saudi": string, "why_now": string, "misa_action": string, '
         '"validation_required": [string]}],\n'
-        '  "trade_bodies": [{"organisation": string, "type": string, '
-        '"role": string}],\n'
-        '  "recommendations": [string],\n'
         '  "data_limitations": [string]\n'
         "}\n"
         "RULES:\n"
@@ -571,9 +532,13 @@ def company_targeting_json_system_addon() -> str:
         "manufacturing, R&D, SSC, logistics hub, JV). No one-liners.\n"
         "- Provide theses ONLY for the company names listed in the user "
         "message. Add at most 3 new_entry_targets not already listed.\n"
-        "- recommendations: EACH bullet MUST name a specific company from "
-        "the list AND a concrete MISA next step (not generic 'engage "
-        "stakeholders').\n"
+        "- recommendations: 8-10 strings. EACH starts with a bolded "
+        "verb-led action naming BOTH a specific company from the list "
+        "AND its Saudi counterpart, then the rationale with the key "
+        "figure bolded — e.g. '**Organize a NEOM Digital Transformation "
+        "Roundtable with TCS RHQ and SDAIA** to co-design pilot "
+        "projects, leveraging TCS's **USD 30 billion** revenue scale.' "
+        "Never generic 'engage stakeholders'.\n"
         "- trade_bodies: ONLY bodies of the origin country in the "
         "request (national IPA + chambers + export finance). Never "
         "include another country's IPA (e.g. Invest India in a German "
@@ -666,8 +631,9 @@ def seed_company_targeting_payload_from_db(
     ]
     return {
         "title": (
-            f"Targeting {country} Companies for Investment Attraction: "
-            "Strategic List and Investment Thesis"
+            f"Targeting {origin_adjective(country)} Companies for "
+            "Investment Attraction: Strategic Prioritization and "
+            "Investment Thesis"
         ),
         "executive_summary": {
             "key_findings": [
@@ -1776,12 +1742,48 @@ def merge_thesis_enrichment(payload: dict, enrichment: dict | None) -> dict:
         if t.get("company")
     ]
 
-    def _names_company(text: str) -> bool:
-        tl = text.casefold()
-        return any(n[:10].casefold() in tl for n in target_names if len(n) >= 4)
+    _GENERIC_NAME_TOKENS = {
+        "regional", "headquarters", "headquarter", "limited", "ltd",
+        "company", "co", "llc", "services", "service", "group",
+        "international", "arabia", "saudi", "middle", "east", "rhq",
+    }
 
+    def _company_aliases(name: str) -> set[str]:
+        """Matchable aliases: name prefix, distinctive words, initials
+        acronym — so 'TCS' counts as naming Tata Consultancy Services."""
+        words = [w for w in re.split(r"[^A-Za-z0-9]+", name) if w]
+        aliases = {name[:10].casefold()}
+        for w in words:
+            if len(w) >= 4 and w.casefold() not in _GENERIC_NAME_TOKENS:
+                aliases.add(w.casefold())
+        sig = [w for w in words if w.casefold() not in _GENERIC_NAME_TOKENS]
+        if len(sig) >= 2:
+            aliases.add("".join(w[0] for w in sig).casefold())
+        return aliases
+
+    _alias_sets = [_company_aliases(n) for n in target_names if len(n) >= 4]
+
+    def _names_company(text: str) -> bool:
+        tokens = set(re.split(r"[^A-Za-z0-9]+", text.casefold()))
+        tl = text.casefold()
+        return any(
+            (aliases & tokens) or any(a in tl for a in aliases if len(a) > 6)
+            for aliases in _alias_sets
+        )
+
+    # Enrichment bullets lead — they carry the rich, counterpart-anchored
+    # actions; seed stubs ("Account review with …") are fallback filler
+    # only when the model produced too few named actions. Enrichment recs
+    # that name no known company are kept after the named ones rather
+    # than dropped — the addon already constrains them to this brief.
+    enrich_named = [r for r in enrich_recs if _names_company(r)]
+    enrich_other = [r for r in enrich_recs if r not in enrich_named]
+    ordered_recs = (
+        enrich_named + enrich_other if len(enrich_named) >= 4
+        else enrich_named + enrich_other + seed_recs
+    )
     merged_recs = []
-    for r in seed_recs + [r for r in enrich_recs if _names_company(r)]:
+    for r in ordered_recs:
         if r and r not in merged_recs:
             merged_recs.append(r)
     if not merged_recs:
