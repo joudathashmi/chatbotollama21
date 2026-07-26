@@ -699,23 +699,33 @@ def enrich_advisory_deliverable(
     text, f = _ensure_strategic_context(text, country, db_context)
     fixes.extend(f)
 
-    text, f = _ensure_footprint(text, country, db_context)
-    fixes.extend(f)
+    # Corridor sections (footprint, ranking, sector scaffold, origin trade
+    # bodies, roadmap, KPIs) only belong to origin-market attraction asks.
+    # A corridor-less strategy analysis (no origin country and no footprint
+    # counts) keeps its adaptive thematic shape — injecting a roadmap or
+    # trade-bodies table there is structural noise, not depth.
+    has_corridor = bool(country) or (
+        (db_context or {}).get("companies_from_origin_licensed_in_saudi")
+        is not None
+    )
+    if has_corridor:
+        text, f = _ensure_footprint(text, country, db_context)
+        fixes.extend(f)
 
-    text, f = _ensure_priority_ranking_table(text, db_context)
-    fixes.extend(f)
+        text, f = _ensure_priority_ranking_table(text, db_context)
+        fixes.extend(f)
 
-    text, f = _ensure_sector_deep_dive_scaffold(text, d, db_context)
-    fixes.extend(f)
+        text, f = _ensure_sector_deep_dive_scaffold(text, d, db_context)
+        fixes.extend(f)
 
-    text, f = _ensure_trade_bodies(text, country)
-    fixes.extend(f)
+        text, f = _ensure_trade_bodies(text, country)
+        fixes.extend(f)
 
-    text, f = _ensure_phased_roadmap(text, d, db_context)
-    fixes.extend(f)
+        text, f = _ensure_phased_roadmap(text, d, db_context)
+        fixes.extend(f)
 
-    text, f = _ensure_kpi_governance(text, d)
-    fixes.extend(f)
+        text, f = _ensure_kpi_governance(text, d)
+        fixes.extend(f)
 
     text, f = _ensure_actionable_recommendations(text, db_context)
     fixes.extend(f)

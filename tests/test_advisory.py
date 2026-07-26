@@ -293,7 +293,7 @@ def test_engagement_plan_prompt_is_a_plan_not_an_assessment():
 
 def test_unknown_deliverable_falls_back_to_adaptive_structure():
     p = advisory_system_prompt("en", "nonsense_label")
-    assert "adaptive to the ask" in p
+    assert "STRUCTURE YOU ADAPT" in p and "OTHERWISE (an ANALYSIS" in p
 
 
 def test_advisory_prompt_enforces_specificity():
