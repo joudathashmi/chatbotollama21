@@ -404,6 +404,22 @@ def _scrub_backend_noise(
         return answer
     import re as _re
     text = answer
+    # 0. Decorative filler adjectives — grammar-safe removal. These are
+    #    hollow intensifiers the model attaches to otherwise-specific
+    #    nouns ("world-class engineering conglomerates such as Samsung");
+    #    deleting the adjective before its noun always leaves valid,
+    #    tighter prose and removes the whiff of generalisation a MISA
+    #    analyst distrusts. Only leading attributive adjectives are
+    #    stripped — noun-form fillers are left to the prompt to avoid
+    #    breaking sentences.
+    text = _re.sub(
+        r"(?i)\b(?:world[- ]class|cutting[- ]edge|best[- ]in[- ]class|"
+        r"best[- ]in[- ]breed|state[- ]of[- ]the[- ]art|game[- ]changing|"
+        r"next[- ]generation|industry[- ]leading|top[- ]tier)\s+"
+        r"(?=[a-z])",
+        "",
+        text,
+    )
     # 1. Confidence tags — and the space before them
     text = _re.sub(r"\s?\((High|Medium|Low|Unknown)\)", "", text)
     # 2. Web citation handles (preserve when the UI will hyperlink them)

@@ -395,7 +395,35 @@ def compose_document_answer(
     if not strong:
         return {"answer": "", "doc_sources": [], "enough": False}
 
-    enough = any(len(h.text) > 40 for h in strong) or sum(h.score for h in strong) >= min_score
+    # Relevance gate for "documents win". OR-match retrieval returns a hit
+    # for any single shared word, so mere presence of a hit is NOT enough
+    # to pre-empt a database / advisory answer — otherwise a question that
+    # merely says "Saudi Arabia" pulls an unrelated uploaded report. Require
+    # the question's DISTINCTIVE (non-stopword, non-boilerplate) terms to be
+    # meaningfully covered by the best chunk.
+    _STOP = {
+        "the", "a", "an", "of", "in", "on", "to", "for", "and", "or", "is",
+        "are", "what", "which", "who", "how", "many", "does", "do", "tell",
+        "me", "about", "give", "show", "according", "report", "saudi",
+        "arabia", "kingdom", "misa", "company", "companies", "investment",
+        "attracting", "attract", "market", "sector", "sectors",
+    }
+    q_terms = {
+        t for t in re.findall(r"[A-Za-z0-9]{3,}", (question or "").lower())
+        if t not in _STOP
+    }
+    best_text = (strong[0].text or "").lower() if strong else ""
+    covered = {t for t in q_terms if t in best_text}
+    coverage = (len(covered) / len(q_terms)) if q_terms else 0.0
+    top_score = max((h.score for h in strong), default=0.0)
+    # Enough only when the best chunk actually covers the question's
+    # DISTINCTIVE terms — never on incidental boilerplate ("Saudi Arabia"
+    # / "companies") alone. The score branch still requires at least one
+    # distinctive term present, so a high rank driven purely by stopword-
+    # class overlap cannot pre-empt a DB/advisory answer.
+    enough = bool(q_terms) and bool(covered) and (
+        coverage >= 0.34 or top_score >= 1.5
+    )
     sources = []
     evidence_blocks = []
     for h in strong:

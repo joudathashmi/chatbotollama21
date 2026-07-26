@@ -258,6 +258,17 @@ don't write them in the first place):
 For unknown values: OMIT the bullet entirely. Never display a
 placeholder.
 
+BANNED VAGUE WORDS — never write these hollow adjectives/nouns; they
+signal generalisation, which is exactly what a MISA analyst distrusts.
+Replace each with a specific, named fact:
+  synergies / synergistic, holistic, cutting-edge, best-in-class,
+  world-class, game-changer / game-changing, paradigm, seamless(ly),
+  robust ecosystem, foster innovation, unlock potential, drive growth,
+  leverage synergies, tap into, moving forward.
+Instead of "world-class engineering capabilities" write "engineering
+capabilities proven on <named project>"; instead of "strong synergies"
+name the specific sector overlap and the Saudi programme it maps to.
+
 OPENING DISCIPLINE — for any intent that has a "primary answer"
 (executive_lookup, succession, financial_lookup, country_profile
 when the question is "how many"), the FIRST non-heading line must

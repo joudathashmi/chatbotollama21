@@ -326,19 +326,34 @@ class PostgresDocumentStore:
             return []
         k = top_k or config.DOCUMENTS_RETRIEVAL_TOP_K
         vis_sql, vis_params = _visible_clause(username)
+        # OR-match, not AND: a question like "According to the report, what
+        # is the internet penetration rate in the Kingdom" must still find
+        # the chunk even though 'report'/'according' never appear in it.
+        # plainto_tsquery ANDs every content word (& → all-or-nothing); we
+        # rewrite '&' to '|' so ANY term matches, then rank by ts_rank_cd
+        # so the densest-overlap chunk floats to the top. The downstream
+        # min-score filter keeps weak single-word hits out of the answer.
         sql = f"""
+            WITH q AS (
+                SELECT NULLIF(
+                    replace(plainto_tsquery('english', %s)::text, ' & ', ' | '),
+                    ''
+                )::tsquery AS tq
+            )
             SELECT c.document_id, d.filename, c.chunk_index, c.text,
-                   ts_rank_cd(c.tsv, plainto_tsquery('english', %s)) AS score
+                   ts_rank_cd(c.tsv, q.tq) AS score
             FROM document_chunks c
             JOIN documents d ON d.id = c.document_id
+            CROSS JOIN q
             WHERE d.status = 'ready'
               AND {vis_sql}
-              AND c.tsv @@ plainto_tsquery('english', %s)
+              AND q.tq IS NOT NULL
+              AND c.tsv @@ q.tq
             ORDER BY score DESC
             LIMIT %s
         """
         with _pg_conn().cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, [q, *vis_params, q, k])
+            cur.execute(sql, [q, *vis_params, k])
             rows = cur.fetchall()
         return [
             ChunkHit(

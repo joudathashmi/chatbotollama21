@@ -4745,7 +4745,18 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
     # docs_first keeps the legacy exclusive short-circuit; docs_only never
     # calls the web. Explicit "only from the document" overrides hybrid.
     from app import config as _doc_cfg
-    if getattr(_doc_cfg, "DOCUMENTS_ENABLED", False):
+    # A multi-page advisory deliverable (market fit, engagement plan,
+    # sector priorities, targeting, corridor strategy) must NOT be
+    # pre-empted by an incidental document match — e.g. an uploaded
+    # internet-penetration report matching "Saudi Arabia" in a German
+    # market-fit question. Only an explicit "from the document" ask
+    # lets a document win over the advisory path.
+    from app.services.document_ingest import wants_docs_only as _wants_docs_only
+    _skip_docs_for_advisory = (
+        _is_advisory_question(user_question)
+        and not _wants_docs_only(user_question)
+    )
+    if getattr(_doc_cfg, "DOCUMENTS_ENABLED", False) and not _skip_docs_for_advisory:
         try:
             from app.services.audit_log import get_audit_user
             from app.services.document_ingest import (
