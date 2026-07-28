@@ -244,6 +244,19 @@ def enrich_entity_brief_depth(
         fixes.append("injected_person_role")
 
     anchors = _demand_anchors_for_text(text)
+    # For a person brief the engagement subject is the COMPANY they lead,
+    # never the person. Pull the employer from the Role lead
+    # ("**Tim Cook is CEO at Apple Inc.**") so the strategic sections talk
+    # about the organisation, not "Tim Cook is a priority account".
+    employer = None
+    if is_person:
+        me = re.search(
+            r"(?i)\b(?:is|as)\s+[\w /&-]*?\b(?:at|of|for|with)\s+"
+            r"\*{0,2}([A-Z][\w.&'-]*(?:\s+[A-Z][\w.&'-]*){0,4})",
+            text,
+        )
+        if me:
+            employer = re.sub(r"[.,'*]+$", "", me.group(1)).strip()
     try:
         from app.services.recommendation_quality import saudi_counterpart_for_sector
         # Prefer sector cue from brief text for a single named counterpart.
@@ -269,12 +282,23 @@ def enrich_entity_brief_depth(
                 f"pitch. Prioritise accounts with licence / RHQ upside and "
                 f"clear localisation commitments.\n"
             )
+        elif is_person:
+            org = employer or "the organisation they lead"
+            ctx = (
+                "## Strategic Context\n\n"
+                f"**{name}** is the senior leadership contact for engaging "
+                f"**{org}** on Saudi investment. Route engagement through "
+                f"{org}'s installed Saudi / MENA footprint — {anchors} — "
+                f"with a dated capability offer to **{counterpart}**, not a "
+                f"generic outreach, and convert warm licence / RHQ presence "
+                f"into expansion commitments.\n"
+            )
         else:
             ctx = (
                 "## Strategic Context\n\n"
                 f"**{name}** is a priority account for Saudi investment "
                 f"attraction. Lead with demand corridors that match this "
-                f"account — {anchors} — and a dated capability offer to "
+                f"company — {anchors} — and a dated capability offer to "
                 f"**{counterpart}**, not a generic partnership pitch. MISA "
                 f"should deepen the installed Saudi / MENA footprint and "
                 f"convert warm licence / RHQ presence into expansion "
@@ -304,7 +328,18 @@ def enrich_entity_brief_depth(
 
     if not _RECS_RE.search(text):
         weak_sector = "sector-qualified" in anchors
-        if is_sector:
+        if is_person:
+            org = employer or "the organisation they lead"
+            recs = (
+                "## Recommended Next Actions for MISA\n\n"
+                f"- Open a MISA relationship track with **{name}** as the "
+                f"executive sponsor for engaging **{org}** within 90 days.\n"
+                f"- Map **{org}**'s Saudi / MENA footprint to {anchors} and "
+                f"table a written RHQ / localisation offer to **{counterpart}**.\n"
+                f"- Secure a LEAP / FII calendar slot with **{org}** anchored "
+                f"to {name}'s office and a named Saudi counterpart.\n"
+            )
+        elif is_sector:
             recs = (
                 "## Recommended Next Actions for MISA\n\n"
                 f"- Run a sector desk review for **{name}** within 90 days — "
