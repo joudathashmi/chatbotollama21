@@ -85,6 +85,22 @@ def search_with_status(query: str, max_results: int = 5) -> dict:
             "verified_empty": True,
             "record_count": 0,
         }
+    # Finder order: Tavily (keyed, reliable) → OpenAI search-preview
+    # (if the public key has credit) → DuckDuckGo (keyless backstop).
+    try:
+        _tv = _tavily_search(q, max_results)
+        if _tv:
+            return {
+                "results": _tv,
+                "retrieval_status": "SUCCESS_WITH_RESULTS",
+                "do_not_claim_zero": False,
+                "source_name": "web_search_tavily",
+                "error": None,
+                "verified_empty": False,
+                "record_count": len(_tv),
+            }
+    except Exception:
+        pass
     client = get_public_openai_client()
     if client is None:
         try:
@@ -154,6 +170,61 @@ def search_with_status(query: str, max_results: int = 5) -> dict:
         }
 
 
+
+
+
+def _tavily_search(query: str, max_results: int) -> list[dict]:
+    """Primary web finder: Tavily (LLM-native search API).
+
+    Returns rows in the same shape as the other finders, with a leading
+    synthesis stub when Tavily provides a grounded answer. Residency-safe:
+    only the query text leaves the host. Raises on failure so the caller
+    can fall back to DuckDuckGo.
+    """
+    import json as _json
+    import urllib.request
+
+    from app.config import TAVILY_API_KEY
+    if not TAVILY_API_KEY:
+        raise RuntimeError("no tavily key")
+    body = _json.dumps({
+        "query": (query or "").strip(),
+        "max_results": max(1, min(max_results, 10)),
+        "include_answer": True,
+        "search_depth": "basic",
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {TAVILY_API_KEY}",
+        },
+    )
+    data = _json.loads(urllib.request.urlopen(req, timeout=20).read())
+    rows: list[dict] = []
+    answer = (data.get("answer") or "").strip()
+    if answer:
+        rows.append({
+            "title": "Grounded web answer",
+            "url": "",
+            "snippet": answer,
+            "is_synthesis": True,
+            "source": "tavily",
+        })
+    for r in data.get("results") or []:
+        url = (r.get("url") or "").strip()
+        if not url:
+            continue
+        rows.append({
+            "title": (r.get("title") or url).strip(),
+            "url": url,
+            # Tavily already returns substantive page content — no extra
+            # fetch needed.
+            "snippet": (r.get("content") or r.get("title") or "").strip(),
+            "source": "tavily",
+        })
+    return rows
 
 
 def _fetch_page_text(url: str, max_chars: int = 2500) -> str:

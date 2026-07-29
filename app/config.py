@@ -727,6 +727,10 @@ LINKEDIN_DEFAULT_PROVIDER: str = (os.getenv("LINKEDIN_DEFAULT_PROVIDER") or "ddg
 # Serper.dev credentials/endpoint (only needed when provider=serp is used).
 SERPER_API_KEY: str = (os.getenv("SERPER_API_KEY") or "").strip()
 SERPER_BASE_URL: str = (os.getenv("SERPER_BASE_URL") or "https://google.serper.dev/search").strip()
+# Tavily — primary web-search finder (LLM-native, reliable free tier).
+# Falls back to DuckDuckGo when unset/failing. Web search sends only the
+# question/entity text; no MISA data egresses.
+TAVILY_API_KEY: str = (os.getenv("TAVILY_API_KEY") or "").strip()
 # Per-query result cap and overall network timeout for profile search.
 LINKEDIN_MAX_RESULTS: int = max(1, int(os.getenv("LINKEDIN_MAX_RESULTS", "50")))
 LINKEDIN_SEARCH_TIMEOUT_SEC: float = float(os.getenv("LINKEDIN_SEARCH_TIMEOUT_SEC", "12"))
