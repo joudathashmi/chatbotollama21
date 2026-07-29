@@ -346,14 +346,18 @@ def finalize_answer(
             r"(?im)^#{1,3}\s*(What'?s\s+Reported|From\s+the\s+web|Live\s+Web)",
             text,
         ))
-        from app.services.chat_engine import _is_forward_looking_exec_question
+        from app.services.chat_engine import (
+            _is_forward_looking_exec_question,
+            _is_current_officeholder_question,
+        )
+        is_office = _is_current_officeholder_question(user_question or "")
         forward = (
             intent == "executive_succession"
             or _is_forward_looking_exec_question(user_question or "")
         )
         # Only for person / executive answers (a ## Role brief), never for
         # advisories or company corridor docs.
-        if (forward and not already and not has_web and is_person):
+        if ((forward or is_office) and not already and not has_web and is_person):
             from app.database import get_openai_client
             from app.config import ADVISORY_MODEL, OPENAI_MODEL
             from app.services.chat_engine import _augment_exec_answer_with_web
@@ -363,9 +367,9 @@ def finalize_answer(
                 text = _augment_exec_answer_with_web(
                     text, user_question or "", _c,
                     ADVISORY_MODEL or OPENAI_MODEL,
-                    lead_with_web=(intent == "executive_succession"),
+                    lead_with_web=(is_office or intent == "executive_succession"),
                     capture_sources=srcs,
-                    mode="succession",
+                    mode="current_office" if is_office else "succession",
                 )
                 pack["_exec_web_augmented"] = True
                 if srcs:

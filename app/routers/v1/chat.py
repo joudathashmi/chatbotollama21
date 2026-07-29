@@ -1076,20 +1076,34 @@ async def chat_endpoint(req: ChatRequest, user: str = Depends(verify_credentials
             deliverable=result.get("_advisory_deliverable"),
             answer_source=result.get("_answer_source"),
         )
-        # Succession safety net (guaranteed choke point — req.question is
-        # always present here). A forward-looking exec question ("who is
-        # the upcoming new CEO", "Tim Cook's successor") must name the
-        # successor from the web; the DB only holds the CURRENT holder, so
-        # some phrasings reached the client naming only the sitting CEO.
+        # Web-verification safety net (guaranteed choke point — req.question
+        # is always present here). ROOT-CAUSE FIX for a class of bugs, not a
+        # single symptom: the DB holds only the CURRENT record, so any
+        # question whose true answer is time-sensitive news must be web-
+        # verified. The augmentation used to live inside one internal
+        # branch, so answers that reached the client through a different
+        # path (general curation, etc.) silently skipped it — that is why
+        # "who is the upcoming CEO" named the sitting CEO and "who is the
+        # current Minister" named a stale office-holder. Deciding it here,
+        # once, covers every path and every trigger:
+        #   - forward-looking / succession  → name the successor
+        #   - current cabinet / office-holder → live web MUST lead (the
+        #     executives table lags royal decrees)
         try:
             import re as _re
             from app.services.chat_engine import (
                 _is_forward_looking_exec_question,
+                _is_current_officeholder_question,
                 _augment_exec_answer_with_web,
             )
             _intent = (
                 result.get("_intent")
                 or (result.get("_query_intent") or {}).get("intent")
+            )
+            _is_office = _is_current_officeholder_question(req.question or "")
+            _is_succ = (
+                _intent == "executive_succession"
+                or _is_forward_looking_exec_question(req.question or "")
             )
             _has_web = bool(_re.search(
                 r"(?im)^#{1,3}\s*(What'?s\s+Reported|From\s+the\s+web|Live\s+Web)",
@@ -1100,10 +1114,7 @@ async def chat_endpoint(req: ChatRequest, user: str = Depends(verify_credentials
                 not result.get("_exec_web_augmented")
                 and not _has_web
                 and _is_role
-                and (
-                    _intent == "executive_succession"
-                    or _is_forward_looking_exec_question(req.question or "")
-                )
+                and (_is_succ or _is_office)
             ):
                 from app.database import get_openai_client
                 from app.config import ADVISORY_MODEL, OPENAI_MODEL
@@ -1113,14 +1124,17 @@ async def chat_endpoint(req: ChatRequest, user: str = Depends(verify_credentials
                     polished = _augment_exec_answer_with_web(
                         polished, req.question or "", _c,
                         ADVISORY_MODEL or OPENAI_MODEL,
-                        lead_with_web=(_intent == "executive_succession"),
-                        capture_sources=_srcs, mode="succession",
+                        # Office-holder facts and confirmed succession lead
+                        # with the web; speculative succession appends it.
+                        lead_with_web=(_is_office or _intent == "executive_succession"),
+                        capture_sources=_srcs,
+                        mode="current_office" if _is_office else "succession",
                     )
                     if _srcs:
                         result.setdefault("web_sources", []).extend(_srcs)
                         sources, clickable = _pack_answer_sources(result)
         except Exception:
-            logger.exception("succession web augmentation failed")
+            logger.exception("exec/officeholder web augmentation failed")
         post_state, summary = _finalize_state(pre_state, req.question, {
             **(result or {}),
             "debug": debug_payload,
