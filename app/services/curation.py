@@ -404,6 +404,13 @@ def _scrub_backend_noise(
         return answer
     import re as _re
     text = answer
+    # 0a. Un-weld headings the model glued to the end of the previous line
+    #     ("…named Saudi counterpart.## Strategic Conclusion"). This runs
+    #     in the universal polish path so it covers advisory answers too,
+    #     not only the ones that reach finalize_answer. A '#' mid-sentence
+    #     (e.g. "#1 ranked") is left alone — only 2–4 '#' followed by a
+    #     space (a real ATX heading) is un-welded.
+    text = _re.sub(r"([^\n\s])(#{2,4}\s+)", r"\1\n\n\2", text)
     # 0. Decorative filler adjectives — grammar-safe removal. These are
     #    hollow intensifiers the model attaches to otherwise-specific
     #    nouns ("world-class engineering conglomerates such as Samsung");
