@@ -4777,6 +4777,36 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
                     user_question, ui_locale, resp_loc, pack,
                 ),
             }
+        # Web verification produced nothing (no OPENAI_API_KEY, no quota, or
+        # the search backend is down). A cabinet office-holder question must
+        # STILL never fall through to the company/executives database: that
+        # table holds the PREVIOUS minister (Khalid Al-Falih, on record since
+        # 2020) and the LLM would compose a confident "the current Minister
+        # is Al-Falih" brief from it — the exact wrong answer this branch
+        # exists to prevent. Fail honest instead: say live verification is
+        # unavailable rather than shipping a stale name as current fact.
+        pack["_short_circuit"] = "officeholder_unverified"
+        pack["_intent"] = "executive_lookup"
+        pack["_answer_source"] = "web_officeholder_unavailable"
+        _oh_note = (
+            "I can't confirm the current office-holder right now — live web "
+            "verification is unavailable (the web-search key or quota is not "
+            "configured on this server). This role changes by royal decree and "
+            "the internal executive database is not an authoritative source for "
+            "who currently holds a government office, so I won't name one from "
+            "it. Please re-ask once web search is available, or check the "
+            "Ministry of Investment (MISA) site directly."
+        )
+        return {
+            "answer": _oh_note,
+            "tool_calls": [],
+            "error": None,
+            "web_sources": [],
+            "_answer_source": "web_officeholder_unavailable",
+            "feedback_context": hf.build_feedback_context(
+                user_question, ui_locale, resp_loc, pack,
+            ),
+        }
 
     # DOCUMENT RETRIEVAL (library → optional web complement → else DB).
     # Strong library hits answer from documents. In hybrid mode (default)
