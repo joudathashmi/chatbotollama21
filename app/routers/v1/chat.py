@@ -999,9 +999,24 @@ async def _chat_sse_generator(
     # Italian "Ministero…") and streams a bogus company briefing. Force it
     # to the legacy path, where _chat_execute's office-holder short-circuit
     # answers it from live web instead.
+    #
+    # Same trap for RHQ / MISA-licensing COUNT questions ("how many RHQ
+    # licences", "how many rhq", "number of rhq licensed companies"): the
+    # fast path classifies "rhq" as a company / financial lookup and
+    # streams a bogus "1 active RHQ license" brief, while the SAME question
+    # phrased slightly differently falls to the legacy path and gets the
+    # correct deterministic 727 / 95,671 snapshot. That inconsistency is
+    # the bug. Force every count phrasing to the legacy deterministic
+    # handler so the answer is identical regardless of wording.
     try:
-        from app.services.chat_engine import _is_current_officeholder_question
-        if prep is not None and _is_current_officeholder_question(req.question or ""):
+        from app.services.chat_engine import (
+            _is_current_officeholder_question,
+            _is_saudi_licensing_count_question,
+        )
+        if prep is not None and (
+            _is_current_officeholder_question(req.question or "")
+            or _is_saudi_licensing_count_question(req.question or "")
+        ):
             prep = None
     except Exception:
         pass

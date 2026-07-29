@@ -141,6 +141,45 @@ def test_private_company_ceo_is_not_officeholder():
     assert not _is_current_officeholder_question("who is the CEO of Apple")
 
 
+@pytest.mark.parametrize("q", [
+    "how many RHQ licenses do we have",
+    "how many rhq",
+    "how many RHQ we have",
+    "count of RHQ licenses",
+    "number of rhq licensed companies",
+    "total rhq",
+    "rhq total",
+    "hoe many licenses RHQ we have",   # real user typo from a screenshot
+    "how many licenses RHQ we have",
+    "how much rhq",
+])
+def test_rhq_licensing_count_detected_across_phrasings(q):
+    """Every RHQ / MISA-licensing COUNT phrasing — including the loose and
+    mistyped ones users actually send — must route to the deterministic
+    licensing handler (727 / 95,671), not the fast company-brief path that
+    returned "1 active RHQ license" or "count unavailable". Locks the
+    non-determinism where the SAME question gave three different answers
+    depending on wording."""
+    from app.services.chat_engine import _is_saudi_licensing_count_question
+    assert _is_saudi_licensing_count_question(q), (
+        f"RHQ/licensing count question not detected: {q!r}"
+    )
+
+
+@pytest.mark.parametrize("q", [
+    "who is the CEO of Apple",
+    "tell me about Siemens Energy",
+    "how should MISA engage BlackRock",
+])
+def test_non_count_questions_not_treated_as_licensing_count(q):
+    """The tolerant fallback must not swallow ordinary company / advisory
+    questions — they have no RHQ/licence + quantity signal."""
+    from app.services.chat_engine import _is_saudi_licensing_count_question
+    assert not _is_saudi_licensing_count_question(q), (
+        f"non-count question wrongly routed to licensing count: {q!r}"
+    )
+
+
 def test_officeholder_web_answer_never_rebuilt_into_company_brief():
     """An office-holder web answer ("current Minister of Investment") is a
     government post, not a company. finalize_answer must NOT run it through

@@ -2890,11 +2890,25 @@ _SAUDI_LICENSE_LIST_RE = re.compile(
 
 def _is_saudi_licensing_count_question(question: str) -> bool:
     q = question or ""
-    if not (
+    matched = bool(
         _SAUDI_LICENSING_COUNT_RE.search(q)
         or _SAUDI_LICENSE_LIST_RE.search(q)
-    ):
-        return False
+    )
+    if not matched:
+        # Tolerant fallback: the strict regexes miss loose / mistyped
+        # phrasings the users actually send — "hoe many licenses RHQ we
+        # have" (typo), "rhq total", "how much rhq". Any question that
+        # mentions RHQ or a MISA licence AND asks about a quantity is a
+        # licensing-count ask. Chasing individual typos is a losing game;
+        # this catches the intent. `\bho[we]\b` absorbs the how/hoe slip.
+        has_subject = bool(re.search(r"\brhq\b|regional\s+head|licen[cs]e", q, re.I))
+        has_quantity = bool(re.search(
+            r"\bho[we]\s+many\b|\bhow\s+much\b|\bhowmany\b|\bcount\b|"
+            r"\btotal\b|\bnumber\s+of\b|\bno\.?\s+of\b|\bmany\b",
+            q, re.I,
+        ))
+        if not (has_subject and has_quantity):
+            return False
     # Keep country company-list asks on their own path
     # ("tell me the Indian active companies").
     if _is_country_company_list_question(q) and _detect_origin_country(q):
@@ -4821,8 +4835,14 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
     # market-fit question. Only an explicit "from the document" ask
     # lets a document win over the advisory path.
     from app.services.document_ingest import wants_docs_only as _wants_docs_only
+    # An RHQ / MISA-licensing COUNT is an authoritative database aggregate
+    # (727 RHQ / 95,671 licensed). It must be answered from the deterministic
+    # licensing handler below, NOT pre-empted by an incidentally-matching
+    # uploaded document — e.g. "total rhq" matching the Saudi-internet PDF.
+    # Only an explicit "from the document" ask overrides this.
     _skip_docs_for_advisory = (
-        _is_advisory_question(user_question)
+        (_is_advisory_question(user_question)
+         or _is_saudi_licensing_count_question(user_question))
         and not _wants_docs_only(user_question)
     )
     if getattr(_doc_cfg, "DOCUMENTS_ENABLED", False) and not _skip_docs_for_advisory:
