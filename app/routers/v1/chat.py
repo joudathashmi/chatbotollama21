@@ -582,6 +582,67 @@ def _polish_answer(
         return answer
 
 
+def _verify_time_sensitive_exec(answer: str, question: str, result: dict) -> str:
+    """SINGLE implementation of the forward-looking / office-holder web
+    verification, called at EVERY client egress (non-stream return AND the
+    streaming path) so it can never be branch-local again.
+
+    The database holds only the CURRENT record, so any question whose true
+    answer is time-sensitive news must be web-verified:
+      - forward-looking / succession  → name the successor
+      - current cabinet / office-holder → live web MUST lead (the
+        executives table lags royal decrees)
+
+    Idempotent: no-ops when already augmented or a web section exists.
+    """
+    try:
+        import re as _re
+        from app.services.chat_engine import (
+            _is_forward_looking_exec_question,
+            _is_current_officeholder_question,
+            _augment_exec_answer_with_web,
+        )
+        if not answer or result.get("_exec_web_augmented"):
+            return answer
+        if _re.search(
+            r"(?im)^#{1,3}\s*(What'?s\s+Reported|From\s+the\s+web|Live\s+Web)",
+            answer,
+        ):
+            return answer
+        if not _re.search(r"(?m)^##\s+Role\b", answer):
+            return answer
+        intent = (
+            result.get("_intent")
+            or (result.get("_query_intent") or {}).get("intent")
+        )
+        is_office = _is_current_officeholder_question(question or "")
+        is_succ = (
+            intent == "executive_succession"
+            or _is_forward_looking_exec_question(question or "")
+        )
+        if not (is_office or is_succ):
+            return answer
+        from app.database import get_openai_client
+        from app.config import ADVISORY_MODEL, OPENAI_MODEL
+        client = get_openai_client()
+        if client is None:
+            return answer
+        srcs: list = []
+        out = _augment_exec_answer_with_web(
+            answer, question or "", client, ADVISORY_MODEL or OPENAI_MODEL,
+            lead_with_web=(is_office or intent == "executive_succession"),
+            capture_sources=srcs,
+            mode="current_office" if is_office else "succession",
+        )
+        result["_exec_web_augmented"] = True
+        if srcs:
+            result.setdefault("web_sources", []).extend(srcs)
+        return out
+    except Exception:
+        logger.exception("exec/officeholder web verification failed")
+        return answer
+
+
 # ---------------------------------------------------------------------------
 # SSE generator
 # ---------------------------------------------------------------------------
@@ -973,6 +1034,14 @@ async def _chat_sse_generator(
         })
         return
 
+    # Same time-sensitive exec verification the non-stream path uses — so a
+    # succession / office-holder question named the successor / current
+    # holder in the browser (which streams) too, not only via the JSON API.
+    _before_stream = answer
+    answer = _verify_time_sensitive_exec(answer, req.question, result)
+    if answer is not _before_stream:
+        sources, clickable = _pack_answer_sources(result)
+
     for para in answer.split("\n\n"):
         if para.strip():
             yield _sse({"type": "chunk", "text": para + "\n\n"})
@@ -1089,52 +1158,10 @@ async def chat_endpoint(req: ChatRequest, user: str = Depends(verify_credentials
         #   - forward-looking / succession  → name the successor
         #   - current cabinet / office-holder → live web MUST lead (the
         #     executives table lags royal decrees)
-        try:
-            import re as _re
-            from app.services.chat_engine import (
-                _is_forward_looking_exec_question,
-                _is_current_officeholder_question,
-                _augment_exec_answer_with_web,
-            )
-            _intent = (
-                result.get("_intent")
-                or (result.get("_query_intent") or {}).get("intent")
-            )
-            _is_office = _is_current_officeholder_question(req.question or "")
-            _is_succ = (
-                _intent == "executive_succession"
-                or _is_forward_looking_exec_question(req.question or "")
-            )
-            _has_web = bool(_re.search(
-                r"(?im)^#{1,3}\s*(What'?s\s+Reported|From\s+the\s+web|Live\s+Web)",
-                polished,
-            ))
-            _is_role = bool(_re.search(r"(?m)^##\s+Role\b", polished))
-            if (
-                not result.get("_exec_web_augmented")
-                and not _has_web
-                and _is_role
-                and (_is_succ or _is_office)
-            ):
-                from app.database import get_openai_client
-                from app.config import ADVISORY_MODEL, OPENAI_MODEL
-                _c = get_openai_client()
-                if _c is not None:
-                    _srcs: list = []
-                    polished = _augment_exec_answer_with_web(
-                        polished, req.question or "", _c,
-                        ADVISORY_MODEL or OPENAI_MODEL,
-                        # Office-holder facts and confirmed succession lead
-                        # with the web; speculative succession appends it.
-                        lead_with_web=(_is_office or _intent == "executive_succession"),
-                        capture_sources=_srcs,
-                        mode="current_office" if _is_office else "succession",
-                    )
-                    if _srcs:
-                        result.setdefault("web_sources", []).extend(_srcs)
-                        sources, clickable = _pack_answer_sources(result)
-        except Exception:
-            logger.exception("exec/officeholder web augmentation failed")
+        _before = polished
+        polished = _verify_time_sensitive_exec(polished, req.question, result)
+        if polished is not _before:
+            sources, clickable = _pack_answer_sources(result)
         post_state, summary = _finalize_state(pre_state, req.question, {
             **(result or {}),
             "debug": debug_payload,
