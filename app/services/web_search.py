@@ -155,6 +155,59 @@ def search_with_status(query: str, max_results: int = 5) -> dict:
 
 
 
+
+def _fetch_page_text(url: str, max_chars: int = 2500) -> str:
+    """Fetch a public web page and return readable plain text.
+
+    Turns thin search snippets into real article content so the Azure /
+    local synthesis model writes from substance. Residency-safe: only a
+    public URL is requested; no MISA data leaves the host. Best-effort —
+    returns "" on any failure or non-HTML response.
+    """
+    import re
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36"
+                )
+            },
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "html" not in ctype and "text" not in ctype:
+                return ""
+            raw = resp.read(400_000).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    # Drop script/style/nav, then tags, collapse whitespace.
+    raw = re.sub(r"(?is)<(script|style|noscript|header|footer|nav)[^>]*>.*?</\1>", " ", raw)
+    text = re.sub(r"(?s)<[^>]+>", " ", raw)
+    import html as _html
+    text = _html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
+def _enrich_with_page_text(results: list, top_n: int = 3) -> None:
+    """Attach real article text to the top results, in place."""
+    n = 0
+    for r in results:
+        url = (r.get("url") or "").strip()
+        if not url.startswith("http"):
+            continue
+        body = _fetch_page_text(url)
+        if body:
+            r["snippet"] = body
+            n += 1
+        if n >= top_n:
+            break
+
+
 def _ddg_search_fallback(query: str, max_results: int) -> list[dict]:
     """Keyless web search via DuckDuckGo's lite endpoint.
 
@@ -199,6 +252,13 @@ def _ddg_search_fallback(query: str, max_results: int) -> list[dict]:
         })
         if len(rows) >= max(1, min(max_results, 10)):
             break
+    # Give the (Azure/local) synthesis model real article text, not just
+    # titles — this is what closes most of the quality gap vs. the paid
+    # search models.
+    try:
+        _enrich_with_page_text(rows)
+    except Exception:
+        pass
     return rows
 
 
