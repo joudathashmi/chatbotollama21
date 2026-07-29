@@ -348,7 +348,9 @@ def finalize_answer(
     # forward-looking and the answer has no reported-web section yet.
     try:
         intent = (pack.get("_intent") or "")
-        already = pack.get("_exec_web_augmented")
+        # Content-based idempotency (see router): a template repair can
+        # wipe an earlier augmentation while the flag still says done.
+        already = False
         has_web = bool(re.search(
             r"(?im)^#{1,3}\s*(What'?s\s+Reported|From\s+the\s+web|Live\s+Web)",
             text,
@@ -374,7 +376,7 @@ def finalize_answer(
                 text = _augment_exec_answer_with_web(
                     text, user_question or "", _c,
                     ADVISORY_MODEL or OPENAI_MODEL,
-                    lead_with_web=(is_office or intent == "executive_succession"),
+                    lead_with_web=(is_office or forward),
                     capture_sources=srcs,
                     mode="current_office" if is_office else "succession",
                 )
