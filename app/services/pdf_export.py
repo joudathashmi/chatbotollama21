@@ -127,6 +127,11 @@ def _render_sources_html(web_sources: Optional[list[dict]]) -> str:
         if not url:
             continue
         snippet = (s.get("snippet") or "").strip()
+        # Keyless search results carry snippet == title; printing both
+        # renders every source twice. Show the snippet only when it adds
+        # information beyond the title.
+        if snippet.casefold() == title.casefold():
+            snippet = ""
         snippet = snippet[:200] + ("…" if len(snippet) > 200 else "")
         items.append(
             f'<li><a href="{_escape(url)}">{_escape(title)}</a>'

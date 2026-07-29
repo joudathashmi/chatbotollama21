@@ -172,3 +172,31 @@ def test_gate_does_not_duplicate_sections(ans):
     assert len(twice) <= len(once) + 4, (
         "content grew on a second finalize pass"
     )
+
+
+# ── 8. Succession answers ship the concise form, not the person brief ────
+def test_succession_answer_is_compact_and_transition_aware():
+    """A factual 'who is next' must NOT ship the two-page person brief:
+    no outgoing-CEO biography, no corridor boilerplate, no recommendations
+    anchored to the departing executive — and the one strategic line must
+    point at the INCOMING office. Locks the compact rebuild."""
+    from app.routers.v1.chat import _compact_succession_answer
+    bloated = (
+        "## Supporting reporting\n\n"
+        "## What's Reported (Live Web)\n\n"
+        "**John Ternus is reported as Tim Cook's expected successor as "
+        "Apple CEO.** [web:1]\n\n"
+        "### Supporting reporting\n- Cook becomes Executive Chairman. [web:1]\n\n"
+        "## Role\n\nTim Cook is CEO at Apple Inc.\n* Position: CEO\n\n"
+        "## Strategic Context\n\nVision 2030 demand corridors...\n\n"
+        "## Background\n\n- Cook joined Apple in 1998, ex Compaq and IBM...\n\n"
+        "## 🇸🇦 Strategic Read\n\n- use Tim Cook as the executive sponsor.\n\n"
+        "## Recommended Next Actions for MISA\n\n- Brief Tim Cook within 90 days.\n"
+    )
+    out = _compact_succession_answer(bloated)
+    assert out.startswith("## What's Reported")          # answer first
+    assert "Compaq" not in out                            # no outgoing bio
+    assert "demand corridors" not in out                  # no boilerplate
+    assert "Brief Tim Cook" not in out                    # no departing-CEO asks
+    assert "John Ternus" in out and "engagement window" in out
+    assert _compact_succession_answer(out) == out         # idempotent

@@ -582,6 +582,68 @@ def _polish_answer(
         return answer
 
 
+
+def _compact_succession_answer(text: str) -> str:
+    """Concise form for forward-looking succession questions.
+
+    ROOT-CAUSE of the bloated two-page PDF: a factual "who is next"
+    question got the full person-brief treatment (outgoing CEO biography,
+    corridor Strategic Context, recommendations addressed to the DEPARTING
+    executive) with the web answer stapled on top. Rebuild instead:
+      1. What's Reported (the successor, cited) — the actual answer
+      2. One line: current holder on record
+      3. One transition-aware Strategic Read (engage the INCOMING office)
+    Idempotent: returns unchanged if already compact.
+    """
+    import re as _re
+    if not text or "## Current Holder on Record" in text:
+        return text
+    m = _re.search(r"(?m)^##\s+What'?s\s+Reported[^\n]*$", text)
+    if not m:
+        return text
+    tail = text[m.start():]
+    stop = _re.search(
+        r"(?m)^##\s+(Role|Strategic Context|Background|.*Strategic Read|"
+        r"Recommended Next|Sources)\b",
+        tail,
+    )
+    web_block = (tail[: stop.start()] if stop else tail).strip()
+
+    # Current holder line from the ## Role section of the original brief.
+    holder = ""
+    rm = _re.search(r"(?ms)^##\s+Role\s*\n+(.+?)(?=\n##\s|\Z)", text)
+    if rm:
+        for line in rm.group(1).splitlines():
+            line = line.strip().strip("*").strip()
+            if line and not line.startswith(("Position:", "Company:", "Tenure:")):
+                holder = line.rstrip(".*")
+                break
+
+    # Incoming name from the web block ("**John Ternus is reported…").
+    nm = _re.search(
+        r"\*\*([A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]+){0,3})\s+is\s+reported",
+        web_block,
+    )
+    incoming = nm.group(1).strip() if nm else "the incoming appointee"
+
+    parts = [web_block, ""]
+    if holder:
+        parts += ["## Current Holder on Record", "", f"{holder} (MISA record).", ""]
+    parts += [
+        "## 🇸🇦 Strategic Read",
+        "",
+        (
+            f"- The reported transition is the engagement window: open a "
+            f"MISA relationship track with **{incoming}**'s office ahead "
+            f"of the handover, rather than anchoring new asks to the "
+            f"outgoing executive."
+        ),
+        "",
+        "_Sources: live web reporting · MISA executive records._",
+    ]
+    return "\n".join(parts).strip()
+
+
 def _verify_time_sensitive_exec(answer: str, question: str, result: dict) -> str:
     """SINGLE implementation of the forward-looking / office-holder web
     verification, called at EVERY client egress (non-stream return AND the
@@ -612,6 +674,11 @@ def _verify_time_sensitive_exec(answer: str, question: str, result: dict) -> str
             r"(?im)^#{1,3}\s*(What'?s\s+Reported|From\s+the\s+web|Live\s+Web)",
             answer,
         ):
+            # Already web-verified upstream — still enforce the concise
+            # succession form so a factual "who is next" never ships the
+            # two-page person brief.
+            if _is_forward_looking_exec_question(question or ""):
+                return _compact_succession_answer(answer)
             return answer
         if not _re.search(r"(?m)^##\s+Role\b", answer):
             return answer
@@ -653,6 +720,8 @@ def _verify_time_sensitive_exec(answer: str, question: str, result: dict) -> str
         )
         if srcs:
             result.setdefault("web_sources", []).extend(srcs)
+            if is_succ and not is_office:
+                out = _compact_succession_answer(out)
         elif is_succ and out == answer:
             # Honest degradation: the question asks about the FUTURE
             # holder, but live web verification is unavailable (e.g. the
