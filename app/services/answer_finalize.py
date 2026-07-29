@@ -105,6 +105,13 @@ def finalize_answer(
         return answer or ""
     pack = pack or {}
     text = str(answer).strip()
+    # Structural formatting scrub — runs in the ONE gate every answer
+    # passes through, so it can never be path-dependent. Fixes the
+    # "…document library.## From the web" class where a heading is glued
+    # to the end of the previous line and renders inline instead of as a
+    # section. Guarantee a blank line before any '##'/'###' heading that
+    # a composer welded onto preceding text.
+    text = re.sub(r"([^\n])(#{2,4}\s+)", r"\1\n\n\2", text)
     try:
         from app.services.prompt_masking import scrub_system_prompt_leak
         text = scrub_system_prompt_leak(text)
