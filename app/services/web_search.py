@@ -87,17 +87,34 @@ def search_with_status(query: str, max_results: int = 5) -> dict:
         }
     client = get_public_openai_client()
     if client is None:
+        try:
+            rows = _ddg_search_fallback(q, max_results)
+        except Exception as exc:
+            return {
+                "results": [],
+                "retrieval_status": "SOURCE_UNAVAILABLE",
+                "do_not_claim_zero": True,
+                "counts_unavailable": True,
+                "source_name": "web_search",
+                "error": f"no search client; ddg fallback failed: {exc}"[:400],
+                "record_count": 0,
+            }
         return {
-            "results": [],
-            "retrieval_status": "SOURCE_UNAVAILABLE",
-            "do_not_claim_zero": True,
-            "counts_unavailable": True,
-            "source_name": "web_search",
-            "error": "OpenAI public search client not configured",
-            "record_count": 0,
+            "results": rows,
+            "retrieval_status": (
+                "SUCCESS_WITH_RESULTS" if rows else "SUCCESS_EMPTY"
+            ),
+            "do_not_claim_zero": False,
+            "source_name": "web_search_ddg",
+            "error": None,
+            "verified_empty": not bool(rows),
+            "record_count": len(rows or []),
         }
     try:
         rows = _openai_search(client, q, max_results)
+        if not rows:
+            # Belt-and-suspenders: empty OpenAI result → try keyless.
+            rows = _ddg_search_fallback(q, max_results)
         return {
             "results": rows,
             "retrieval_status": (
@@ -110,6 +127,22 @@ def search_with_status(query: str, max_results: int = 5) -> dict:
             "record_count": len(rows or []),
         }
     except Exception as exc:
+        # OpenAI search failed (e.g. 429 insufficient_quota) — keyless
+        # fallback so time-sensitive answers still get live grounding.
+        try:
+            rows = _ddg_search_fallback(q, max_results)
+            if rows:
+                return {
+                    "results": rows,
+                    "retrieval_status": "SUCCESS_WITH_RESULTS",
+                    "do_not_claim_zero": False,
+                    "source_name": "web_search_ddg",
+                    "error": None,
+                    "verified_empty": False,
+                    "record_count": len(rows),
+                }
+        except Exception:
+            pass
         return {
             "results": [],
             "retrieval_status": "SOURCE_UNAVAILABLE",
@@ -119,6 +152,54 @@ def search_with_status(query: str, max_results: int = 5) -> dict:
             "error": str(exc)[:400],
             "record_count": 0,
         }
+
+
+
+def _ddg_search_fallback(query: str, max_results: int) -> list[dict]:
+    """Keyless web search via DuckDuckGo's lite endpoint.
+
+    Fallback when the public OpenAI search client is unavailable or out
+    of quota (429 insufficient_quota). Residency-safe: only the QUERY
+    TEXT leaves the host — identical egress to the OpenAI search path —
+    and the synthesis over these results still runs on the configured
+    (Azure) model. No account or API key required.
+    """
+    import re
+    import urllib.request
+    import urllib.parse
+    import html as _html
+
+    url = (
+        "https://lite.duckduckgo.com/lite/?q="
+        + urllib.parse.quote((query or "").strip())
+    )
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0"},
+    )
+    body = urllib.request.urlopen(req, timeout=15).read().decode(
+        "utf-8", "replace",
+    )
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for href, title_html in re.findall(
+        r'<a[^>]+href="(//duckduckgo\.com/l/\?uddg=[^"]+)"[^>]*>(.*?)</a>',
+        body,
+    ):
+        m = re.search(r"uddg=([^&\"]+)", href)
+        real = urllib.parse.unquote(m.group(1)) if m else ""
+        title = _html.unescape(re.sub(r"<[^>]+>", "", title_html)).strip()
+        if not real or not title or real in seen:
+            continue
+        seen.add(real)
+        rows.append({
+            "title": title,
+            "url": real,
+            "snippet": title,
+            "source": "web",
+        })
+        if len(rows) >= max(1, min(max_results, 10)):
+            break
+    return rows
 
 
 def _openai_search(client, query: str, max_results: int) -> list[dict]:
