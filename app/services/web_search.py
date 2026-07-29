@@ -85,22 +85,10 @@ def search_with_status(query: str, max_results: int = 5) -> dict:
             "verified_empty": True,
             "record_count": 0,
         }
-    # Finder order: Tavily (keyed, reliable) → OpenAI search-preview
-    # (if the public key has credit) → DuckDuckGo (keyless backstop).
-    try:
-        _tv = _tavily_search(q, max_results)
-        if _tv:
-            return {
-                "results": _tv,
-                "retrieval_status": "SUCCESS_WITH_RESULTS",
-                "do_not_claim_zero": False,
-                "source_name": "web_search_tavily",
-                "error": None,
-                "verified_empty": False,
-                "record_count": len(_tv),
-            }
-    except Exception:
-        pass
+    # Finder: OpenAI's gpt-4o(-mini)-search-preview is the single provider
+    # (one API key, native web grounding). DuckDuckGo is only a keyless
+    # emergency backstop when OpenAI is unreachable / out of quota — it
+    # needs no key, so the deployment only ever requires OPENAI_API_KEY.
     client = get_public_openai_client()
     if client is None:
         try:
