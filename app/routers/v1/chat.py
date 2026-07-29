@@ -1076,6 +1076,51 @@ async def chat_endpoint(req: ChatRequest, user: str = Depends(verify_credentials
             deliverable=result.get("_advisory_deliverable"),
             answer_source=result.get("_answer_source"),
         )
+        # Succession safety net (guaranteed choke point — req.question is
+        # always present here). A forward-looking exec question ("who is
+        # the upcoming new CEO", "Tim Cook's successor") must name the
+        # successor from the web; the DB only holds the CURRENT holder, so
+        # some phrasings reached the client naming only the sitting CEO.
+        try:
+            import re as _re
+            from app.services.chat_engine import (
+                _is_forward_looking_exec_question,
+                _augment_exec_answer_with_web,
+            )
+            _intent = (
+                result.get("_intent")
+                or (result.get("_query_intent") or {}).get("intent")
+            )
+            _has_web = bool(_re.search(
+                r"(?im)^#{1,3}\s*(What'?s\s+Reported|From\s+the\s+web|Live\s+Web)",
+                polished,
+            ))
+            _is_role = bool(_re.search(r"(?m)^##\s+Role\b", polished))
+            if (
+                not result.get("_exec_web_augmented")
+                and not _has_web
+                and _is_role
+                and (
+                    _intent == "executive_succession"
+                    or _is_forward_looking_exec_question(req.question or "")
+                )
+            ):
+                from app.database import get_openai_client
+                from app.config import ADVISORY_MODEL, OPENAI_MODEL
+                _c = get_openai_client()
+                if _c is not None:
+                    _srcs: list = []
+                    polished = _augment_exec_answer_with_web(
+                        polished, req.question or "", _c,
+                        ADVISORY_MODEL or OPENAI_MODEL,
+                        lead_with_web=(_intent == "executive_succession"),
+                        capture_sources=_srcs, mode="succession",
+                    )
+                    if _srcs:
+                        result.setdefault("web_sources", []).extend(_srcs)
+                        sources, clickable = _pack_answer_sources(result)
+        except Exception:
+            logger.exception("succession web augmentation failed")
         post_state, summary = _finalize_state(pre_state, req.question, {
             **(result or {}),
             "debug": debug_payload,

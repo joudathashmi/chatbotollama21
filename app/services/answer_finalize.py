@@ -332,6 +332,47 @@ def finalize_answer(
         "question": (user_question or "")[:120],
         "query_intent": (pack.get("_query_intent") or {}).get("task_type"),
     }
+    # Forward-looking executive / succession safety net. The direct
+    # exec-lookup branch web-augments succession questions, but some
+    # phrasings ("who is the upcoming new CEO", "Tim Cook's successor")
+    # reach the client through the general curation path, which skipped
+    # it — so the answer named only the CURRENT CEO. Fire the web
+    # augmentation here, on every path, when the question is
+    # forward-looking and the answer has no reported-web section yet.
+    try:
+        intent = (pack.get("_intent") or "")
+        already = pack.get("_exec_web_augmented")
+        has_web = bool(re.search(
+            r"(?im)^#{1,3}\s*(What'?s\s+Reported|From\s+the\s+web|Live\s+Web)",
+            text,
+        ))
+        from app.services.chat_engine import _is_forward_looking_exec_question
+        forward = (
+            intent == "executive_succession"
+            or _is_forward_looking_exec_question(user_question or "")
+        )
+        # Only for person / executive answers (a ## Role brief), never for
+        # advisories or company corridor docs.
+        if (forward and not already and not has_web and is_person):
+            from app.database import get_openai_client
+            from app.config import ADVISORY_MODEL, OPENAI_MODEL
+            from app.services.chat_engine import _augment_exec_answer_with_web
+            _c = get_openai_client()
+            if _c is not None:
+                srcs: list = []
+                text = _augment_exec_answer_with_web(
+                    text, user_question or "", _c,
+                    ADVISORY_MODEL or OPENAI_MODEL,
+                    lead_with_web=(intent == "executive_succession"),
+                    capture_sources=srcs,
+                    mode="succession",
+                )
+                pack["_exec_web_augmented"] = True
+                if srcs:
+                    pack.setdefault("web_sources", []).extend(srcs)
+    except Exception:
+        pass
+
     # Emit pipeline trace if present
     try:
         tr = pack.get("_pipeline_trace")
