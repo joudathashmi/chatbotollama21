@@ -602,8 +602,12 @@ def _verify_time_sensitive_exec(answer: str, question: str, result: dict) -> str
             _is_current_officeholder_question,
             _augment_exec_answer_with_web,
         )
-        if not answer or result.get("_exec_web_augmented"):
+        if not answer:
             return answer
+        # Idempotency is judged by CONTENT, not by a flag: a later repair
+        # pass can REPLACE the answer (person-template rebuild), wiping an
+        # earlier augmentation while the flag still says "done". If the
+        # web section is present, skip; if it is missing, (re)add it.
         if _re.search(
             r"(?im)^#{1,3}\s*(What'?s\s+Reported|From\s+the\s+web|Live\s+Web)",
             answer,
@@ -622,6 +626,10 @@ def _verify_time_sensitive_exec(answer: str, question: str, result: dict) -> str
         )
         if not (is_office or is_succ):
             return answer
+        logger.info(
+            f"exec-verify: firing (office={is_office} succ={is_succ} "
+            f"intent={intent!r}) for q={question[:60]!r}"
+        )
         from app.database import get_openai_client
         from app.config import ADVISORY_MODEL, OPENAI_MODEL
         client = get_openai_client()
@@ -630,13 +638,35 @@ def _verify_time_sensitive_exec(answer: str, question: str, result: dict) -> str
         srcs: list = []
         out = _augment_exec_answer_with_web(
             answer, question or "", client, ADVISORY_MODEL or OPENAI_MODEL,
-            lead_with_web=(is_office or intent == "executive_succession"),
+            # ALWAYS lead with the web section for forward-looking asks:
+            # the user asked about the FUTURE holder, so the successor must
+            # be the first thing they read, not an appendix below the
+            # current-CEO brief.
+            lead_with_web=(is_office or is_succ),
             capture_sources=srcs,
             mode="current_office" if is_office else "succession",
         )
         result["_exec_web_augmented"] = True
+        logger.info(
+            f"exec-verify: augmented={out is not answer} "
+            f"len {len(answer)}->{len(out)} sources={len(srcs)}"
+        )
         if srcs:
             result.setdefault("web_sources", []).extend(srcs)
+        elif is_succ and out == answer:
+            # Honest degradation: the question asks about the FUTURE
+            # holder, but live web verification is unavailable (e.g. the
+            # search backend is down or out of quota). Say so up front
+            # instead of silently presenting only the current officeholder
+            # — that silence is what reads as a wrong answer.
+            out = (
+                "> **Note:** you asked about the upcoming / future "
+                "holder of this role. Live web verification is currently "
+                "unavailable, so reported succession news cannot be "
+                "confirmed right now. The brief below reflects the "
+                "CURRENT holder on record in the MISA database.\n\n"
+                + answer
+            )
         return out
     except Exception:
         logger.exception("exec/officeholder web verification failed")
