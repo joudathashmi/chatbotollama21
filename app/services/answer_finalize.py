@@ -131,10 +131,33 @@ def finalize_answer(
     # Company briefing asks that still lack Jul21 shape → deterministic
     # template. Never run this on corridor advisories — it can replace a
     # full engagement plan with a named-company Engagement Recommendation.
+    # An office-holder answer ("current Minister of Investment in Saudi
+    # Arabia") is authoritative live-web content about a GOVERNMENT post,
+    # not a company. It must NEVER be run through the company/person
+    # entity-repair templates below: those fuzzy-match "Investment" to a
+    # random firm (Equitix, Franklin Templeton, the Italian "Ministero…")
+    # and rebuild the clean 400-char web answer into a bogus 3,000-char
+    # company "Executive Briefing". Detect it from the question CONTENT
+    # (not just a pack flag) so every path that reaches this gate — the
+    # early short-circuit, the streaming legacy path, the curation path —
+    # is protected, and treat it like advisory: skip entity repair.
+    _office = (
+        pack.get("_answer_source") == "web_officeholder"
+        or pack.get("_short_circuit") == "officeholder_web"
+    )
+    if not _office:
+        try:
+            from app.services.chat_engine import (
+                _is_current_officeholder_question as _isoh_fin,
+            )
+            _office = _isoh_fin(user_question or "")
+        except Exception:
+            pass
     _adv = (
         pack.get("_answer_source") == "strategic_advisory"
         or pack.get("_short_circuit") == "strategic_advisory"
         or pack.get("_advisory_deliverable")
+        or _office
     )
     if not _adv:
         try:

@@ -993,6 +993,18 @@ async def _chat_sse_generator(
     (full chat() call, then paragraph-chunked SSE) for everything else."""
     # Try fast streaming path
     prep = await _prepare_fast_stream(req)
+    # A current cabinet / office-holder question ("current Minister of
+    # Investment in Saudi Arabia") must NEVER take the fast company-brief
+    # path — it fuzzy-matches "Investment" to a random firm (Equitix, the
+    # Italian "Ministero…") and streams a bogus company briefing. Force it
+    # to the legacy path, where _chat_execute's office-holder short-circuit
+    # answers it from live web instead.
+    try:
+        from app.services.chat_engine import _is_current_officeholder_question
+        if prep is not None and _is_current_officeholder_question(req.question or ""):
+            prep = None
+    except Exception:
+        pass
     if prep is not None:
         history = [{"role": m.role, "content": m.content} for m in req.history]
         _hist, pre_state, sid, hist_meta = _prepare_session_history(

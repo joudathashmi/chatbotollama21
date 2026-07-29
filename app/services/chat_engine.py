@@ -4739,6 +4739,45 @@ def _chat_execute(user_question: str, history: list, ui_locale: str = "en") -> d
             ),
         }
 
+    # CURRENT CABINET / GOVERNMENT OFFICE-HOLDER — early short-circuit.
+    # "current Minister of Investment in Saudi Arabia" is a GOVERNMENT
+    # office question, NOT a company. Answering it must never touch the
+    # company entity resolver, which fuzzy-matches "Investment" to random
+    # firms (Equitix, the Italian "Ministero dell'Economia", …) and ships
+    # a bogus "CEO" briefing. Route straight to the web-grounded holder
+    # answer here, before any company matching runs.
+    if _is_current_officeholder_question(user_question):
+        _oh_sources: list = []
+        from app.config import ADVISORY_MODEL as _OH_ADV
+        _oh_answer = _augment_exec_answer_with_web(
+            "", user_question, client, _OH_ADV or OPENAI_MODEL,
+            lead_with_web=True,
+            capture_sources=_oh_sources,
+            mode="current_office",
+        )
+        if _oh_answer and _oh_answer.strip():
+            pack["_short_circuit"] = "officeholder_web"
+            pack["_intent"] = "executive_lookup"
+            pack["_answer_source"] = "web_officeholder"
+            pack["_exec_web_augmented"] = True
+            try:
+                from app.services.answer_finalize import finalize_answer
+                _oh_answer = finalize_answer(
+                    _oh_answer, user_question=user_question, pack=pack,
+                )
+            except Exception:
+                pass
+            return {
+                "answer": _oh_answer,
+                "tool_calls": [],
+                "error": None,
+                "web_sources": _oh_sources,
+                "_answer_source": "web_officeholder",
+                "feedback_context": hf.build_feedback_context(
+                    user_question, ui_locale, resp_loc, pack,
+                ),
+            }
+
     # DOCUMENT RETRIEVAL (library → optional web complement → else DB).
     # Strong library hits answer from documents. In hybrid mode (default)
     # we also consult the live web and merge both with dual provenance.

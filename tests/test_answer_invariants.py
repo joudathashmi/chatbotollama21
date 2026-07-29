@@ -141,6 +141,48 @@ def test_private_company_ceo_is_not_officeholder():
     assert not _is_current_officeholder_question("who is the CEO of Apple")
 
 
+def test_officeholder_web_answer_never_rebuilt_into_company_brief():
+    """An office-holder web answer ("current Minister of Investment") is a
+    government post, not a company. finalize_answer must NOT run it through
+    the company entity-repair template — even when the pack carries a
+    fuzzy-matched company entity (the "Investment" → Equitix / Franklin
+    Templeton mismatch). Locks the bug where the clean ~400-char web answer
+    became a 3,000-char bogus "Executive Briefing"."""
+    clean_web = (
+        "## Role\n\n"
+        "**Fahd Al-Saif is Saudi Arabia's Minister of Investment, "
+        "appointed February 2026.**\n"
+        "- He replaced Khalid Al-Falih in a cabinet reshuffle. [web:1]\n\n"
+        "_Sources: public reporting._"
+    )
+    # Poison the pack exactly as the live pipeline does: a fuzzy company
+    # entity plus a company-briefing intent. The guard must ignore both.
+    hostile_pack = {
+        "_answer_source": "web_officeholder",
+        "_short_circuit": "officeholder_web",
+        "_intent": "company_profile",
+        "entity_candidate": "Investment",
+        "_entity": "Equitix Investment Management Ltd",
+        "rows": [{"company_name": "Equitix Investment Management Ltd"}],
+    }
+    out = finalize_answer(
+        clean_web,
+        user_question="current Minister of Investment in Saudi arabia",
+        pack=hostile_pack,
+    )
+    assert "Executive Briefing" not in out, (
+        "office-holder answer was rebuilt into a company Executive Briefing"
+    )
+    assert "Equitix" not in out and "Franklin" not in out, (
+        "fuzzy company entity leaked into the office-holder answer"
+    )
+    assert "Al-Saif" in out, "the actual office-holder name was dropped"
+    # It must stay compact — the web answer, not a padded template.
+    assert len(out) < 3 * len(clean_web), (
+        "office-holder answer ballooned — entity repair likely ran"
+    )
+
+
 # ── 7. The single gate is idempotent ─────────────────────────────────────
 @pytest.mark.parametrize("ans", [
     "## Role\n\n**Tim Cook is CEO at Apple Inc.**\n\n## Background\n\n- x.\n",
