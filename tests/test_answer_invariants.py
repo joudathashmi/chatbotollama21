@@ -44,6 +44,26 @@ def test_person_brief_never_leaks_this_account_placeholder():
     assert "Apple" in out
 
 
+def test_person_brief_no_leak_with_plain_nonbold_role_lead():
+    """The real pipeline often emits the Role lead as PLAIN text, not bold
+    ('Tim Cook is the current CEO of Apple Inc.'). That format used to make
+    name resolution fall back to the 'this account' placeholder and leak it
+    into the Strategic Context. Lock the non-bold case explicitly."""
+    real = (
+        "## Role\n\n"
+        "Tim Cook is the current CEO of Apple Inc.\n"
+        "Apple's regional headquarters for the Middle East is in Dubai, UAE.\n\n"
+        "## Background\n\n- Tim Cook succeeded Steve Jobs.\n\n"
+        "## 🇸🇦 Strategic Read\n\n- Engage.\n"
+    )
+    out, _ = enrich_entity_brief_depth(real, intent="executive_lookup")
+    assert "this account" not in out.lower()
+    # The person is named, and the employer is clean (not welded to the
+    # next line's "regional headquarters").
+    assert "**Tim Cook**" in out
+    assert "regional headquarters** on" not in out
+
+
 def test_person_brief_frames_sections_on_company_not_person():
     thin = (
         "## Role\n\n**Satya Nadella is CEO at Microsoft Corp.**\n\n"

@@ -82,6 +82,19 @@ def _entity_name_from_brief(answer: str) -> str:
     m = re.search(r"(?im)^\*\*(.+?)\s+is\s+", answer or "")
     if m:
         return m.group(1).strip()
+    # Plain (non-bold) Role lead: "Tim Cook is the current CEO of Apple Inc."
+    # The real pipeline often emits the lead without bold, which used to
+    # fall through to the "this account" placeholder and leak into the
+    # Strategic Context. Parse the first sentence of the ## Role section.
+    rm = re.search(r"(?im)^##\s+Role\s*\n+(.+)$", answer or "")
+    if rm:
+        first = rm.group(1).strip().lstrip("*").strip()
+        nm = re.match(
+            r"([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3})\s+is\b",
+            first,
+        )
+        if nm:
+            return nm.group(1).strip()
     return "this account"
 
 
@@ -250,10 +263,21 @@ def enrich_entity_brief_depth(
     # about the organisation, not "Tim Cook is a priority account".
     employer = None
     if is_person:
+        # Match on the ROLE LEAD LINE ONLY (single line, no newline
+        # crossing) so we don't capture "Apple Inc.\n Apple's regional
+        # headquarters" as one employer. Take the first company-like token
+        # run after "CEO/…of/at <Company>", stopping at punctuation.
+        lead_line = ""
+        rm = re.search(r"(?im)^##\s+Role\s*\n+([^\n]+)", text)
+        if rm:
+            lead_line = rm.group(1)
+        else:
+            bm = re.search(r"(?m)^\*\*([^\n*]+)\*\*", text)
+            lead_line = bm.group(1) if bm else text.split("\n", 1)[0]
         me = re.search(
-            r"(?i)\b(?:is|as)\s+[\w /&-]*?\b(?:at|of|for|with)\s+"
-            r"\*{0,2}([A-Z][\w.&'-]*(?:\s+[A-Z][\w.&'-]*){0,4})",
-            text,
+            r"(?i)\b(?:at|of|for|with)\s+"
+            r"([A-Z][\w.&'-]*(?:\s+[A-Z][\w.&'-]*){0,3})",
+            lead_line,
         )
         if me:
             employer = re.sub(r"[.,'*]+$", "", me.group(1)).strip()
@@ -393,6 +417,18 @@ def enrich_entity_brief_depth(
                 count=1,
             )
             fixes.append("injected_vision_anchor_in_strategic_read")
+
+    # Hard guard — the literal "this account" placeholder must NEVER reach
+    # the client. If name resolution failed anywhere above, rewrite the
+    # residual placeholder to a neutral phrasing rather than leak it.
+    if re.search(r"(?i)\bthis account\b", text):
+        text = re.sub(
+            r"(?i)\*{0,2}this account\*{0,2}\s+(is|holds)\b",
+            r"This organisation's leadership \1",
+            text,
+        )
+        text = re.sub(r"(?i)\bthis account\b", "this organisation", text)
+        fixes.append("scrubbed_this_account_placeholder")
 
     return text, fixes
 
